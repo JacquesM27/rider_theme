@@ -854,9 +854,9 @@ public class QueueConsumerService : BackgroundService
 // Serwis do publikowania wiadomości
 public interface IMessagePublisher
 {
-    Task PublishAsync<T>(string queueName, T message, MessageProperties properties = null);
-    Task PublishAsync(string queueName, string message, MessageProperties properties = null);
-    Task PublishAsync(string queueName, byte[] messageBody, MessageProperties properties = null);
+    Task PublishAsync<T>(string exchangeName, T message, MessageProperties properties = null, string routingKey = "");
+    Task PublishAsync(string exchangeName, string message, MessageProperties properties = null, string routingKey = "");
+    Task PublishAsync(string exchangeName, byte[] messageBody, MessageProperties properties = null, string routingKey = "");
 }
 
 // Właściwości wiadomości dla publikowania
@@ -871,22 +871,20 @@ public class MessageProperties
     public Dictionary<string, object> Headers { get; set; } = new();
     public DateTime? Expiration { get; set; }
     public byte Priority { get; set; } = 0;
+    public TimeSpan ConfirmTimeout { get; set; } = TimeSpan.FromSeconds(5);
 }
 
 public class MessagePublisherService : IMessagePublisher
 {
     private readonly IRabbitMqManager _rabbitMqManager;
-    private readonly IConfigLoader _configLoader;
     private readonly ILogger<MessagePublisherService> _logger;
     private readonly JsonSerializerOptions _jsonOptions;
 
     public MessagePublisherService(
         IRabbitMqManager rabbitMqManager,
-        IConfigLoader configLoader,
         ILogger<MessagePublisherService> logger)
     {
         _rabbitMqManager = rabbitMqManager ?? throw new ArgumentNullException(nameof(rabbitMqManager));
-        _configLoader = configLoader ?? throw new ArgumentNullException(nameof(configLoader));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         
         _jsonOptions = new JsonSerializerOptions
@@ -897,28 +895,28 @@ public class MessagePublisherService : IMessagePublisher
         };
     }
 
-    public async Task PublishAsync<T>(string queueName, T message, MessageProperties properties = null)
+    public async Task PublishAsync<T>(string exchangeName, T message, MessageProperties properties = null, string routingKey = "")
     {
         if (message == null)
             throw new ArgumentNullException(nameof(message));
 
         string jsonMessage = JsonSerializer.Serialize(message, _jsonOptions);
-        await PublishAsync(queueName, jsonMessage, properties);
+        await PublishAsync(exchangeName, jsonMessage, properties, routingKey);
     }
 
-    public async Task PublishAsync(string queueName, string message, MessageProperties properties = null)
+    public async Task PublishAsync(string exchangeName, string message, MessageProperties properties = null, string routingKey = "")
     {
         if (string.IsNullOrEmpty(message))
             throw new ArgumentException("Message cannot be null or empty", nameof(message));
 
         var body = Encoding.UTF8.GetBytes(message);
-        await PublishAsync(queueName, body, properties);
+        await PublishAsync(exchangeName, body, properties, routingKey);
     }
 
-    public async Task PublishAsync(string queueName, byte[] messageBody, MessageProperties properties = null)
+    public async Task PublishAsync(string exchangeName, byte[] messageBody, MessageProperties properties = null, string routingKey = "")
     {
-        if (string.IsNullOrEmpty(queueName))
-            throw new ArgumentException("Queue name cannot be null or empty", nameof(queueName));
+        if (string.IsNullOrEmpty(exchangeName))
+            throw new ArgumentException("Exchange name cannot be null or empty", nameof(exchangeName));
         
         if (messageBody == null || messageBody.Length == 0)
             throw new ArgumentException("Message body cannot be null or empty", nameof(messageBody));
@@ -931,27 +929,27 @@ public class MessagePublisherService : IMessagePublisher
         {
             try
             {
-                await PublishMessageInternal(queueName, messageBody, properties);
+                await PublishMessageInternal(exchangeName, messageBody, properties, routingKey);
                 
-                _logger.LogDebug("Pomyślnie opublikowano wiadomość {MessageId} do kolejki {QueueName}", 
-                    properties.MessageId, queueName);
+                _logger.LogDebug("Pomyślnie opublikowano wiadomość {MessageId} na exchange {ExchangeName} z routing key '{RoutingKey}'", 
+                    properties.MessageId, exchangeName, routingKey);
                 
                 return; // Success, exit retry loop
             }
             catch (Exception ex) when (retryCount < maxRetries)
             {
                 retryCount++;
-                _logger.LogWarning(ex, "Błąd podczas publikowania wiadomości {MessageId} do kolejki {QueueName} - próba {RetryCount}/{MaxRetries}", 
-                    properties.MessageId, queueName, retryCount, maxRetries);
+                _logger.LogWarning(ex, "Błąd podczas publikowania wiadomości {MessageId} na exchange {ExchangeName} - próba {RetryCount}/{MaxRetries}", 
+                    properties.MessageId, exchangeName, retryCount, maxRetries);
                 
                 // Spróbuj odtworzyć kanał przed kolejną próbą
                 try
                 {
-                    await _rabbitMqManager.RecreateChannelAsync(queueName);
+                    await _rabbitMqManager.RecreateChannelAsync($"publisher_{exchangeName}");
                 }
                 catch (Exception recreateEx)
                 {
-                    _logger.LogError(recreateEx, "Nie udało się odtworzyć kanału dla kolejki {QueueName}", queueName);
+                    _logger.LogError(recreateEx, "Nie udało się odtworzyć kanału publishera dla exchange {ExchangeName}", exchangeName);
                 }
                 
                 // Exponential backoff
@@ -960,65 +958,114 @@ public class MessagePublisherService : IMessagePublisher
         }
         
         // Jeśli dotarliśmy tutaj, wszystkie retry się nie powiodły
-        throw new InvalidOperationException($"Nie udało się opublikować wiadomości do kolejki {queueName} po {maxRetries} próbach");
+        throw new InvalidOperationException($"Nie udało się opublikować wiadomości na exchange {exchangeName} po {maxRetries} próbach");
     }
 
-    private async Task PublishMessageInternal(string queueName, byte[] messageBody, MessageProperties properties)
+    private async Task PublishMessageInternal(string exchangeName, byte[] messageBody, MessageProperties properties, string routingKey)
     {
-        // Pobierz kanał dla danej kolejki
-        var channel = await _rabbitMqManager.GetChannelAsync(queueName);
+        // Pobierz kanał dla publishera (używamy specjalnej nazwy kanału dla publisher)
+        var channelKey = $"publisher_{exchangeName}";
+        var channel = await _rabbitMqManager.GetChannelAsync(channelKey);
         
-        // Upewnij się, że kolejka istnieje - pobierz konfigurację
-        var queueConfig = await _configLoader.GetQueueConfigAsync(queueName);
-        
-        // Zadeklaruj kolejkę (idempotentne - nie problem jeśli już istnieje)
-        channel.QueueDeclare(
-            queue: queueConfig.QueueName,
-            durable: queueConfig.Durable,
-            exclusive: queueConfig.Exclusive,
-            autoDelete: queueConfig.AutoDelete,
-            arguments: queueConfig.Arguments);
-
-        // Utwórz właściwości AMQP
-        var basicProperties = channel.CreateBasicProperties();
-        basicProperties.MessageId = properties.MessageId;
-        basicProperties.Persistent = properties.DeliveryMode == 2;
-        basicProperties.DeliveryMode = properties.DeliveryMode;
-        basicProperties.ContentType = properties.ContentType;
-        basicProperties.ContentEncoding = properties.ContentEncoding;
-        basicProperties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-        basicProperties.Priority = properties.Priority;
-
-        if (!string.IsNullOrEmpty(properties.CorrelationId))
-            basicProperties.CorrelationId = properties.CorrelationId;
-
-        if (!string.IsNullOrEmpty(properties.ReplyTo))
-            basicProperties.ReplyTo = properties.ReplyTo;
-
-        if (properties.Expiration.HasValue)
-            basicProperties.Expiration = ((long)(properties.Expiration.Value - DateTime.UtcNow).TotalMilliseconds).ToString();
-
-        if (properties.Headers?.Any() == true)
+        try
         {
-            basicProperties.Headers = new Dictionary<string, object>(properties.Headers);
+            // Włącz publisher confirms
+            channel.ConfirmSelect();
+
+            // Użyj twojego extension method do tworzenia basic properties
+            var basicProperties = channel.CreateBasicPropertiesWithHeaders(properties);
+
+            // Publikuj wiadomość na exchange z routing key (domyślnie pusty)
+            channel.BasicPublish(
+                exchange: exchangeName,
+                routingKey: routingKey, // Użyj parametru routing key
+                basicProperties: basicProperties,
+                body: messageBody);
+
+            // Czekaj na potwierdzenie z timeoutem
+            if (!channel.WaitForConfirms(properties.ConfirmTimeout))
+            {
+                throw new InvalidOperationException($"Timeout podczas oczekiwania na potwierdzenie publikacji wiadomości {properties.MessageId} na exchange {exchangeName}");
+            }
+
+            _logger.LogDebug("Wiadomość {MessageId} została potwierdzona na exchange {ExchangeName} z routing key '{RoutingKey}' (rozmiar: {Size} bajtów)", 
+                properties.MessageId, exchangeName, routingKey, messageBody.Length);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Błąd podczas publikowania wiadomości {MessageId} na exchange {ExchangeName} z routing key '{RoutingKey}'", 
+                properties.MessageId, exchangeName, routingKey);
+            throw;
+        }
+    }
+}
+
+// Extension methods dla channel (dostosuj do swoich potrzeb)
+// UWAGA: To jest przykład - musisz zaimplementować swój CreateBasicPropertiesWithHeaders method
+public static class ChannelExtensions
+{
+    // Pierwsza wersja - używa MessageProperties
+    public static IBasicProperties CreateBasicPropertiesWithHeaders(this IModel channel, MessageProperties messageProperties)
+    {
+        var basicProperties = channel.CreateBasicProperties();
+        
+        // Ustaw podstawowe właściwości
+        basicProperties.MessageId = messageProperties.MessageId;
+        basicProperties.Persistent = messageProperties.DeliveryMode == 2;
+        basicProperties.DeliveryMode = messageProperties.DeliveryMode;
+        basicProperties.ContentType = messageProperties.ContentType;
+        basicProperties.ContentEncoding = messageProperties.ContentEncoding;
+        basicProperties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        basicProperties.Priority = messageProperties.Priority;
+
+        if (!string.IsNullOrEmpty(messageProperties.CorrelationId))
+            basicProperties.CorrelationId = messageProperties.CorrelationId;
+
+        if (!string.IsNullOrEmpty(messageProperties.ReplyTo))
+            basicProperties.ReplyTo = messageProperties.ReplyTo;
+
+        if (messageProperties.Expiration.HasValue)
+            basicProperties.Expiration = ((long)(messageProperties.Expiration.Value - DateTime.UtcNow).TotalMilliseconds).ToString();
+
+        // Ustaw headers
+        if (messageProperties.Headers?.Any() == true)
+        {
+            basicProperties.Headers = new Dictionary<string, object>(messageProperties.Headers);
         }
 
-        // Publikuj wiadomość
-        channel.BasicPublish(
-            exchange: "", // Default exchange (direct to queue)
-            routingKey: queueName,
-            basicProperties: basicProperties,
-            body: messageBody);
+        return basicProperties;
+    }
+    
+    // Druga wersja - jeśli twój istniejący method oczekuje event object
+    public static IBasicProperties CreateBasicPropertiesWithHeaders<T>(this IModel channel, T @event) where T : class
+    {
+        var basicProperties = channel.CreateBasicProperties();
+        
+        // Podstawowe ustawienia
+        basicProperties.MessageId = Guid.NewGuid().ToString();
+        basicProperties.Persistent = true;
+        basicProperties.DeliveryMode = 2;
+        basicProperties.ContentType = "application/json";
+        basicProperties.ContentEncoding = "utf-8";
+        basicProperties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
-        _logger.LogDebug("Wiadomość {MessageId} została wysłana do kolejki {QueueName} (rozmiar: {Size} bajtów)", 
-            properties.MessageId, queueName, messageBody.Length);
+        // Headers na podstawie typu event - dostosuj do swoich potrzeb
+        basicProperties.Headers = new Dictionary<string, object>
+        {
+            ["MessageType"] = typeof(T).Name,
+            ["AssemblyQualifiedName"] = typeof(T).AssemblyQualifiedName,
+            ["PublishedAt"] = DateTime.UtcNow.ToString("O"),
+            ["MachineName"] = Environment.MachineName
+        };
+
+        return basicProperties;
     }
 }
 
 // Rozszerzenie dla wygodnego publikowania
 public static class MessagePublisherExtensions
 {
-    public static async Task PublishOrderAsync<T>(this IMessagePublisher publisher, T order, string correlationId = null)
+    public static async Task PublishOrderEventAsync<T>(this IMessagePublisher publisher, T orderEvent, string correlationId = null)
     {
         var properties = new MessageProperties
         {
@@ -1027,33 +1074,55 @@ public static class MessagePublisherExtensions
             Headers = new Dictionary<string, object>
             {
                 ["MessageType"] = typeof(T).Name,
+                ["EventType"] = "OrderEvent",
                 ["PublishedAt"] = DateTime.UtcNow.ToString("O")
             }
         };
 
-        await publisher.PublishAsync("orders", order, properties);
+        await publisher.PublishAsync("orders.exchange", orderEvent, properties);
     }
 
-    public static async Task PublishNotificationAsync(this IMessagePublisher publisher, string message, string userId = null)
+    public static async Task PublishNotificationEventAsync(this IMessagePublisher publisher, object notification, string userId = null)
     {
-        var notification = new
-        {
-            Message = message,
-            UserId = userId,
-            Timestamp = DateTime.UtcNow
-        };
-
         var properties = new MessageProperties
         {
             Headers = new Dictionary<string, object>
             {
-                ["MessageType"] = "Notification",
+                ["MessageType"] = "NotificationEvent",
                 ["UserId"] = userId ?? "system"
-            }
+            },
+            ConfirmTimeout = TimeSpan.FromSeconds(10) // Dłuższy timeout dla notifikacji
         };
 
-        await publisher.PublishAsync("notifications", notification, properties);
+        await publisher.PublishAsync("notifications.exchange", notification, properties);
     }
+
+    public static async Task PublishEventAsync<T>(this IMessagePublisher publisher, string exchangeName, T @event, 
+        TimeSpan? confirmTimeout = null, Dictionary<string, object> additionalHeaders = null)
+    {
+        var properties = new MessageProperties
+        {
+            Headers = new Dictionary<string, object>
+            {
+                ["MessageType"] = typeof(T).Name,
+                ["EventType"] = @event.GetType().Name,
+                ["PublishedAt"] = DateTime.UtcNow.ToString("O")
+            },
+            ConfirmTimeout = confirmTimeout ?? TimeSpan.FromSeconds(5)
+        };
+
+        // Dodaj dodatkowe headers jeśli są
+        if (additionalHeaders != null)
+        {
+            foreach (var header in additionalHeaders)
+            {
+                properties.Headers[header.Key] = header.Value;
+            }
+        }
+
+        await publisher.PublishAsync(exchangeName, @event, properties);
+    }
+}
 }
 
 // Wyjątek dla duplikatów wiadomości
@@ -1252,7 +1321,7 @@ public class Program
 }
 
 /*
-Przykłady użycia MessagePublisher:
+Przykłady użycia MessagePublisher z exchange i publisher confirms:
 
 1. W kontrolerze API:
 [ApiController]
@@ -1277,24 +1346,23 @@ public class OrdersController : ControllerBase
             CreatedAt = DateTime.UtcNow 
         };
 
-        // Publikuj do kolejki orders
-        await _messagePublisher.PublishOrderAsync(order, request.CorrelationId);
+        // Publikuj na exchange "orders.exchange" z pustym routing key
+        await _messagePublisher.PublishOrderEventAsync(order, request.CorrelationId);
         
-        // Wyślij notyfikację
-        await _messagePublisher.PublishNotificationAsync(
-            $"Nowe zamówienie {order.Id} zostało utworzone", 
-            request.CustomerId);
+        // Wyślij notyfikację na exchange "notifications.exchange"
+        var notification = new { Message = $"Nowe zamówienie {order.Id}", UserId = request.CustomerId };
+        await _messagePublisher.PublishNotificationEventAsync(notification, request.CustomerId);
 
         return Ok(new { OrderId = order.Id });
     }
 }
 
-2. W serwisie biznesowym:
-public class OrderService
+2. W serwisie biznesowym z różnymi exchange:
+public class PaymentService
 {
     private readonly IMessagePublisher _messagePublisher;
 
-    public OrderService(IMessagePublisher messagePublisher)
+    public PaymentService(IMessagePublisher messagePublisher)
     {
         _messagePublisher = messagePublisher;
     }
@@ -1308,39 +1376,47 @@ public class OrderService
             ProcessedAt = DateTime.UtcNow
         };
 
-        // Różne sposoby publikowania:
+        // Różne sposoby publikowania na exchange:
         
-        // 1. Obiekt + auto-serialization
-        await _messagePublisher.PublishAsync("payments", paymentEvent);
+        // 1. Prostą metodą z extension
+        await _messagePublisher.PublishEventAsync("payments.exchange", paymentEvent);
         
-        // 2. Z custom properties
+        // 2. Z custom timeout i headers
+        await _messagePublisher.PublishEventAsync(
+            "payments.exchange", 
+            paymentEvent, 
+            confirmTimeout: TimeSpan.FromSeconds(10),
+            additionalHeaders: new Dictionary<string, object>
+            {
+                ["OrderId"] = orderId,
+                ["PaymentMethod"] = "CreditCard"
+            });
+        
+        // 3. Bezpośrednio na exchange z custom properties
         var properties = new MessageProperties
         {
             CorrelationId = orderId,
+            ConfirmTimeout = TimeSpan.FromSeconds(5),
             Headers = new Dictionary<string, object>
             {
                 ["EventType"] = "PaymentProcessed",
                 ["Amount"] = amount
             }
         };
-        await _messagePublisher.PublishAsync("payments", paymentEvent, properties);
+        await _messagePublisher.PublishAsync("payments.exchange", paymentEvent, properties);
         
-        // 3. Raw string
+        // 4. Raw string na exchange
         var jsonMessage = JsonSerializer.Serialize(paymentEvent);
-        await _messagePublisher.PublishAsync("payments", jsonMessage);
-        
-        // 4. Raw bytes
-        var bytes = Encoding.UTF8.GetBytes(jsonMessage);
-        await _messagePublisher.PublishAsync("payments", bytes);
+        await _messagePublisher.PublishAsync("payments.exchange", jsonMessage);
     }
 }
 
-3. Background service, który publikuje regularnie:
-public class ReportGeneratorService : BackgroundService
+3. Background service z różnymi exchange:
+public class EventPublisherService : BackgroundService
 {
     private readonly IMessagePublisher _messagePublisher;
 
-    public ReportGeneratorService(IMessagePublisher messagePublisher)
+    public EventPublisherService(IMessagePublisher messagePublisher)
     {
         _messagePublisher = messagePublisher;
     }
@@ -1349,19 +1425,57 @@ public class ReportGeneratorService : BackgroundService
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            var report = GenerateHourlyReport();
+            // Publikuj różne eventy na różne exchange
             
-            await _messagePublisher.PublishAsync("reports", report, new MessageProperties
+            // Health check event
+            var healthEvent = new { Status = "Healthy", Timestamp = DateTime.UtcNow };
+            await _messagePublisher.PublishAsync("health.exchange", healthEvent);
+            
+            // Metrics event z dłuższym timeoutem
+            var metricsEvent = GenerateMetrics();
+            var properties = new MessageProperties
             {
+                ConfirmTimeout = TimeSpan.FromSeconds(10), // Dłuższy timeout dla dużych danych
                 Headers = new Dictionary<string, object>
                 {
-                    ["ReportType"] = "Hourly",
-                    ["GeneratedAt"] = DateTime.UtcNow.ToString("O")
+                    ["MetricType"] = "System",
+                    ["NodeId"] = Environment.MachineName
                 }
-            });
+            };
+            await _messagePublisher.PublishAsync("metrics.exchange", metricsEvent, properties);
 
-            await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
+            await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
         }
+    }
+}
+
+4. Event sourcing pattern:
+public class EventStore
+{
+    private readonly IMessagePublisher _messagePublisher;
+
+    public EventStore(IMessagePublisher messagePublisher)
+    {
+        _messagePublisher = messagePublisher;
+    }
+
+    public async Task PublishDomainEvent<T>(T domainEvent, string aggregateId) where T : class
+    {
+        // Publikuj event na domain exchange
+        var properties = new MessageProperties
+        {
+            CorrelationId = aggregateId,
+            Headers = new Dictionary<string, object>
+            {
+                ["AggregateId"] = aggregateId,
+                ["EventType"] = typeof(T).Name,
+                ["EventVersion"] = "1.0",
+                ["OccurredAt"] = DateTime.UtcNow.ToString("O")
+            },
+            ConfirmTimeout = TimeSpan.FromSeconds(3) // Szybkie potwierdzenie dla eventów
+        };
+
+        await _messagePublisher.PublishAsync("domain.events.exchange", domainEvent, properties);
     }
 }
 */
