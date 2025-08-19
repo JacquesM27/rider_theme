@@ -1,739 +1,603 @@
-/*
-Wymagane pakiety NuGet dla testów:
-- xunit
-- xunit.runner.visualstudio
-- NSubstitute
-- Shouldly
-- Microsoft.Extensions.Logging.Abstractions
-- RabbitMQ.Client (do mockowania)
-*/
+// ===== ROZSZERZENIE MODELU ProcessedMessage =====
+public class ProcessedMessage
+{
+    public string MessageId { get; set; }
+    public string QueueName { get; set; }
+    public string Content { get; set; }
+    public DateTime ProcessedAt { get; set; }
+    public string Status { get; set; }
+    public DateTime? ValidTo { get; set; } // Nowe pole
+}
 
+// ===== ROZSZERZENIE INTERFACE REPOSITORY =====
+public interface IMessageRepository
+{
+    Task<bool> IsMessageProcessedAsync(string messageId, IDbTransaction transaction = null);
+    Task SaveMessageAsync(ProcessedMessage message, IDbTransaction transaction);
+    Task UpdateMessageStatusAsync(string messageId, string status, IDbTransaction transaction);
+    
+    // Nowe metody dla cleanup
+    Task<int> CleanupExpiredMessageContentAsync(DateTime expiredBefore, int batchSize = 1000);
+    Task<int> GetExpiredMessageCountAsync(DateTime expiredBefore);
+}
+
+// ===== ROZSZERZENIE IMPLEMENTACJI REPOSITORY =====
+public partial class MessageRepository : IMessageRepository
+{
+    // ... poprzednie metody pozostają bez zmian ...
+
+    public async Task<int> CleanupExpiredMessageContentAsync(DateTime expiredBefore, int batchSize = 1000)
+    {
+        const string sql = @"
+            UPDATE TOP(@BatchSize) ProcessedMessages 
+            SET Content = NULL 
+            WHERE ValidTo < @ExpiredBefore 
+              AND Content IS NOT NULL";
+
+        try
+        {
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync();
+            
+            // Pojedyncze wykonanie - usuń pętlę!
+            var cleanedCount = await connection.ExecuteAsync(sql, new 
+            { 
+                BatchSize = batchSize,
+                ExpiredBefore = expiredBefore 
+            });
+            
+            _logger.LogInformation("Wyczyszczono {CleanedCount} wiadomości w jednym batch", cleanedCount);
+            
+            return cleanedCount;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Błąd podczas czyszczenia wygasłej zawartości wiadomości");
+            throw;
+        }
+    }
+
+    public async Task<int> GetExpiredMessageCountAsync(DateTime expiredBefore)
+    {
+        const string sql = @"
+            SELECT COUNT(1) 
+            FROM ProcessedMessages 
+            WHERE ValidTo < @ExpiredBefore 
+              AND Content IS NOT NULL";
+
+        try
+        {
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync();
+            
+            var count = await connection.QuerySingleAsync<int>(sql, new { ExpiredBefore = expiredBefore });
+            
+            _logger.LogDebug("Znaleziono {ExpiredCount} wiadomości do wyczyszczenia", count);
+            return count;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Błąd podczas pobierania liczby wygasłych wiadomości");
+            throw;
+        }
+    }
+}
+
+// ===== MESSAGE CLEANUP BACKGROUND SERVICE =====
+public class MessageCleanupService : BackgroundService
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<MessageCleanupService> _logger;
+    private readonly IConfiguration _configuration;
+    private readonly PeriodicTimer _cleanupTimer;
+    private readonly TimeSpan _cleanupInterval;
+    private readonly TimeSpan _retentionPeriod;
+    private readonly int _batchSize;
+    private readonly bool _isEnabled;
+
+    public MessageCleanupService(
+        IServiceProvider serviceProvider,
+        ILogger<MessageCleanupService> logger,
+        IConfiguration configuration)
+    {
+        _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+
+        // Konfiguracja z appsettings
+        _isEnabled = _configuration.GetValue("MessageCleanup:Enabled", true);
+        _cleanupInterval = TimeSpan.FromHours(_configuration.GetValue("MessageCleanup:IntervalHours", 24));
+        _retentionPeriod = TimeSpan.FromDays(_configuration.GetValue("MessageCleanup:RetentionDays", 30));
+        _batchSize = _configuration.GetValue("MessageCleanup:BatchSize", 1000);
+
+        _cleanupTimer = new PeriodicTimer(_cleanupInterval);
+
+        _logger.LogInformation("MessageCleanupService skonfigurowany: Enabled={Enabled}, Interval={Interval}, Retention={Retention}, BatchSize={BatchSize}",
+            _isEnabled, _cleanupInterval, _retentionPeriod, _batchSize);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (!_isEnabled)
+        {
+            _logger.LogInformation("MessageCleanupService jest wyłączony - pomijam");
+            return;
+        }
+
+        _logger.LogInformation("MessageCleanupService rozpoczął pracę");
+
+        try
+        {
+            // Wykonaj cleanup na starcie (jeśli nie jest to pierwsze uruchomienie)
+            await PerformCleanupAsync(stoppingToken);
+
+            // Następnie wykonuj co określony interwał
+            while (await _cleanupTimer.WaitForNextTickAsync(stoppingToken))
+            {
+                await PerformCleanupAsync(stoppingToken);
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("MessageCleanupService został zatrzymany");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Nieoczekiwany błąd w MessageCleanupService");
+        }
+    }
+
+    private async Task PerformCleanupAsync(CancellationToken cancellationToken)
+    {
+        var startTime = DateTime.UtcNow;
+        _logger.LogInformation("Rozpoczynam cleanup wiadomości");
+
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var messageRepository = scope.ServiceProvider.GetRequiredService<IMessageRepository>();
+
+            var expiredBefore = DateTime.UtcNow.Subtract(_retentionPeriod);
+            
+            // Sprawdź ile jest do wyczyszczenia
+            var expiredCount = await messageRepository.GetExpiredMessageCountAsync(expiredBefore);
+            
+            if (expiredCount == 0)
+            {
+                _logger.LogInformation("Brak wiadomości do wyczyszczenia");
+                return;
+            }
+
+            _logger.LogInformation("Znaleziono {ExpiredCount} wiadomości do wyczyszczenia (starszych niż {ExpiredBefore})", 
+                expiredCount, expiredBefore);
+
+            // Wykonaj cleanup
+            var cleanedCount = await messageRepository.CleanupExpiredMessageContentAsync(expiredBefore, _batchSize);
+            
+            var duration = DateTime.UtcNow - startTime;
+            
+            // Jeśli wyczyszczono pełny batch, może być więcej do zrobienia
+            if (cleanedCount == _batchSize)
+            {
+                _logger.LogInformation("Cleanup zakończony - wyczyszczono {CleanedCount} wiadomości (pełny batch - może być więcej do wyczyszczenia przy następnym uruchomieniu) w {Duration}ms",
+                    cleanedCount, duration.TotalMilliseconds);
+            }
+            else
+            {
+                _logger.LogInformation("Cleanup zakończony - wyczyszczono {CleanedCount} z {ExpectedCount} wiadomości w {Duration}ms",
+                    cleanedCount, expiredCount, duration.TotalMilliseconds);
+            }
+
+            // Metryki dla monitoringu
+            LogCleanupMetrics(cleanedCount, expiredCount, duration);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("Cleanup został przerwany z powodu zatrzymania serwisu");
+        }
+        catch (Exception ex)
+        {
+            var duration = DateTime.UtcNow - startTime;
+            _logger.LogError(ex, "Błąd podczas cleanup wiadomości po {Duration}ms", duration.TotalMilliseconds);
+            
+            // Nie rzucamy wyjątku - pozwalamy serwisowi kontynuować przy następnym cyklu
+        }
+    }
+
+    private void LogCleanupMetrics(int cleanedCount, int totalExpiredCount, TimeSpan duration)
+    {
+        // Strukturalne logi dla monitoringu (np. Prometheus, Application Insights)
+        using var scope = _logger.BeginScope(new Dictionary<string, object>
+        {
+            ["CleanedCount"] = cleanedCount,
+            ["TotalExpiredCount"] = totalExpiredCount,
+            ["DurationMs"] = duration.TotalMilliseconds,
+            ["BatchSize"] = _batchSize,
+            ["RetentionDays"] = _retentionPeriod.TotalDays
+        });
+
+        _logger.LogInformation("Cleanup metrics logged");
+    }
+
+    public override void Dispose()
+    {
+        _cleanupTimer?.Dispose();
+        base.Dispose();
+    }
+}
+
+// ===== ROZSZERZENIE SERVICE COLLECTION =====
+public static class ServiceCollectionExtensions
+{
+    public static IServiceCollection AddMessageProcessing(this IServiceCollection services, 
+        string connectionString)
+    {
+        services.AddScoped<IMessageRepository>(provider => 
+            new MessageRepository(connectionString, provider.GetRequiredService<ILogger<MessageRepository>>()));
+        
+        services.AddScoped<ITransactionService>(provider => 
+            new TransactionService(connectionString, provider.GetRequiredService<ILogger<TransactionService>>()));
+
+        services.AddSingleton<IConfigLoader, AppSettingsConfigLoader>();
+        services.AddSingleton<IQueueConsumerFactory, QueueConsumerFactory>();
+        services.AddSingleton<IMessagePublisher, MessagePublisherService>();
+        services.AddHostedService<QueueConsumerManager>();
+        
+        // Dodaj cleanup service
+        services.AddHostedService<MessageCleanupService>();
+        
+        return services;
+    }
+}
+
+// ===== TESTY JEDNOSTKOWE =====
 using System;
-using System.Collections.Generic;
 using System.Data;
-using System.Data.SqlClient;
-using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
 using NSubstitute.ExceptionExtensions;
-using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
 using Shouldly;
 using Xunit;
 
 namespace RabbitMQ.Tests
 {
-    // ===== TESTY RABBITMQ MANAGER =====
-    public class RabbitMqManagerTests : IDisposable
-    {
-        private readonly IConnectionFactory _connectionFactory;
-        private readonly IConnection _connection;
-        private readonly IModel _channel;
-        private readonly ILogger<RabbitMqManager> _logger;
-        private readonly RabbitMqManager _sut;
-
-        public RabbitMqManagerTests()
-        {
-            _connectionFactory = Substitute.For<IConnectionFactory>();
-            _connection = Substitute.For<IConnection>();
-            _channel = Substitute.For<IModel>();
-            _logger = Substitute.For<ILogger<RabbitMqManager>>();
-
-            _connectionFactory.CreateConnection().Returns(_connection);
-            _connection.IsOpen.Returns(true);
-            _connection.CreateModel().Returns(_channel);
-            _channel.IsOpen.Returns(true);
-
-            _sut = new RabbitMqManager(_connectionFactory, _logger);
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_FirstCall_ShouldCreateConnectionAndChannel()
-        {
-            // Act
-            var result = await _sut.GetChannelAsync("test-queue");
-
-            // Assert
-            result.ShouldBe(_channel);
-            _connectionFactory.Received(1).CreateConnection();
-            _connection.Received(1).CreateModel();
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_SameQueueMultipleCalls_ShouldReuseChannel()
-        {
-            // Act
-            var result1 = await _sut.GetChannelAsync("test-queue");
-            var result2 = await _sut.GetChannelAsync("test-queue");
-
-            // Assert
-            result1.ShouldBe(result2);
-            _connection.Received(1).CreateModel(); // Only one channel created
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_DifferentQueues_ShouldCreateSeparateChannels()
-        {
-            // Arrange
-            var channel2 = Substitute.For<IModel>();
-            channel2.IsOpen.Returns(true);
-            _connection.CreateModel().Returns(_channel, channel2);
-
-            // Act
-            var result1 = await _sut.GetChannelAsync("queue1");
-            var result2 = await _sut.GetChannelAsync("queue2");
-
-            // Assert
-            result1.ShouldNotBe(result2);
-            _connection.Received(2).CreateModel();
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_ClosedChannel_ShouldRecreateChannel()
-        {
-            // Arrange
-            await _sut.GetChannelAsync("test-queue");
-            _channel.IsOpen.Returns(false);
-            var newChannel = Substitute.For<IModel>();
-            newChannel.IsOpen.Returns(true);
-            _connection.CreateModel().Returns(newChannel);
-
-            // Act
-            var result = await _sut.GetChannelAsync("test-queue");
-
-            // Assert
-            result.ShouldBe(newChannel);
-            _connection.Received(2).CreateModel();
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_ConnectionClosed_ShouldRecreateConnection()
-        {
-            // Arrange
-            _connection.IsOpen.Returns(false);
-            var newConnection = Substitute.For<IConnection>();
-            var newChannel = Substitute.For<IModel>();
-            newConnection.IsOpen.Returns(true);
-            newConnection.CreateModel().Returns(newChannel);
-            newChannel.IsOpen.Returns(true);
-            _connectionFactory.CreateConnection().Returns(_connection, newConnection);
-
-            // Act
-            var result = await _sut.GetChannelAsync("test-queue");
-
-            // Assert
-            result.ShouldBe(newChannel);
-            _connectionFactory.Received(2).CreateConnection();
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_ConnectionFactoryThrows_ShouldRetryAndEventuallyThrow()
-        {
-            // Arrange
-            _connectionFactory.CreateConnection().Throws(new InvalidOperationException("Connection failed"));
-
-            // Act & Assert
-            var exception = await Should.ThrowAsync<InvalidOperationException>(
-                () => _sut.GetChannelAsync("test-queue"));
-            
-            exception.Message.ShouldContain("Nie udało się nawiązać połączenia z RabbitMQ po 5 próbach");
-        }
-
-        [Fact]
-        public void IsConnected_WhenConnectionIsOpen_ShouldReturnTrue()
-        {
-            // Arrange
-            _connection.IsOpen.Returns(true);
-
-            // Act & Assert
-            _sut.IsConnected.ShouldBeTrue();
-        }
-
-        [Fact]
-        public void IsConnected_WhenConnectionIsClosed_ShouldReturnFalse()
-        {
-            // Arrange
-            _connection.IsOpen.Returns(false);
-
-            // Act & Assert
-            _sut.IsConnected.ShouldBeFalse();
-        }
-
-        [Fact]
-        public async Task RecreateChannelAsync_ExistingChannel_ShouldCloseOldAndCreateNew()
-        {
-            // Arrange
-            await _sut.GetChannelAsync("test-queue");
-            var newChannel = Substitute.For<IModel>();
-            newChannel.IsOpen.Returns(true);
-            _connection.CreateModel().Returns(newChannel);
-
-            // Act
-            await _sut.RecreateChannelAsync("test-queue");
-            var result = await _sut.GetChannelAsync("test-queue");
-
-            // Assert
-            result.ShouldBe(newChannel);
-            _channel.Received(1).Close();
-            _channel.Received(1).Dispose();
-        }
-
-        [Fact]
-        public async Task ReleaseChannelAsync_ExistingChannel_ShouldCloseAndRemove()
-        {
-            // Arrange
-            await _sut.GetChannelAsync("test-queue");
-
-            // Act
-            await _sut.ReleaseChannelAsync("test-queue");
-
-            // Assert
-            _channel.Received(1).Close();
-            _channel.Received(1).Dispose();
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_AfterDispose_ShouldThrowObjectDisposedException()
-        {
-            // Arrange
-            _sut.Dispose();
-
-            // Act & Assert
-            await Should.ThrowAsync<ObjectDisposedException>(() => _sut.GetChannelAsync("test-queue"));
-        }
-
-        [Fact]
-        public void ConnectionLostEvent_WhenConnectionShutdown_ShouldBeRaised()
-        {
-            // Arrange
-            ConnectionEventArgs capturedArgs = null;
-            _sut.ConnectionLost += (sender, args) => capturedArgs = args;
-
-            // Act
-            _connection.ConnectionShutdown += Raise.EventWith(new ShutdownEventArgs(ShutdownInitiator.Application, 200, "Test shutdown"));
-
-            // Assert
-            capturedArgs.ShouldNotBeNull();
-            capturedArgs.Reason.ShouldBe("Test shutdown");
-        }
-
-        public void Dispose()
-        {
-            _sut?.Dispose();
-        }
-    }
-
-    // ===== TESTY CONFIG LOADER =====
-    public class AppSettingsConfigLoaderTests
-    {
-        private readonly IConfiguration _configuration;
-        private readonly ILogger<AppSettingsConfigLoader> _logger;
-        private readonly AppSettingsConfigLoader _sut;
-
-        public AppSettingsConfigLoaderTests()
-        {
-            _configuration = Substitute.For<IConfiguration>();
-            _logger = Substitute.For<ILogger<AppSettingsConfigLoader>>();
-            _sut = new AppSettingsConfigLoader(_configuration, _logger);
-        }
-
-        [Fact]
-        public async Task GetQueueConfigAsync_ValidQueue_ShouldReturnConfig()
-        {
-            // Arrange
-            var section = Substitute.For<IConfigurationSection>();
-            section.Exists().Returns(true);
-            section.GetValue("Durable", true).Returns(false);
-            section.GetValue("Exclusive", false).Returns(true);
-            section.GetValue("AutoDelete", false).Returns(true);
-            section.GetValue<ushort>("PrefetchCount", (ushort)10).Returns((ushort)5);
-            section.GetValue("RetryDelayMs", 5000).Returns(3000);
-
-            _configuration.GetSection("Queues:test-queue").Returns(section);
-
-            // Act
-            var result = await _sut.GetQueueConfigAsync("test-queue");
-
-            // Assert
-            result.ShouldNotBeNull();
-            result.QueueName.ShouldBe("test-queue");
-            result.Durable.ShouldBeFalse();
-            result.Exclusive.ShouldBeTrue();
-            result.AutoDelete.ShouldBeTrue();
-            result.PrefetchCount.ShouldBe((ushort)5);
-            result.RetryDelayMs.ShouldBe(3000);
-        }
-
-        [Fact]
-        public async Task GetQueueConfigAsync_NonExistentQueue_ShouldThrowException()
-        {
-            // Arrange
-            var section = Substitute.For<IConfigurationSection>();
-            section.Exists().Returns(false);
-            _configuration.GetSection("Queues:non-existent").Returns(section);
-
-            // Act & Assert
-            var exception = await Should.ThrowAsync<InvalidOperationException>(
-                () => _sut.GetQueueConfigAsync("non-existent"));
-            
-            exception.Message.ShouldContain("Konfiguracja dla kolejki non-existent nie została znaleziona");
-        }
-
-        [Fact]
-        public async Task GetAllQueueNamesAsync_WithQueues_ShouldReturnNames()
-        {
-            // Arrange
-            var queuesSection = Substitute.For<IConfigurationSection>();
-            var queue1Section = Substitute.For<IConfigurationSection>();
-            var queue2Section = Substitute.For<IConfigurationSection>();
-            
-            queue1Section.Key.Returns("queue1");
-            queue2Section.Key.Returns("queue2");
-            
-            queuesSection.GetChildren().Returns(new[] { queue1Section, queue2Section });
-            _configuration.GetSection("Queues").Returns(queuesSection);
-
-            // Act
-            var result = await _sut.GetAllQueueNamesAsync();
-
-            // Assert
-            result.ShouldContain("queue1");
-            result.ShouldContain("queue2");
-            result.Count().ShouldBe(2);
-        }
-    }
-
-    // ===== TESTY MESSAGE REPOSITORY =====
-    public class MessageRepositoryTests
+    // ===== TESTY MESSAGE REPOSITORY (NOWE METODY) =====
+    public class MessageRepositoryCleanupTests
     {
         private readonly string _connectionString = "test-connection-string";
         private readonly ILogger<MessageRepository> _logger;
         private readonly MessageRepository _sut;
         private readonly IDbConnection _connection;
-        private readonly IDbTransaction _transaction;
 
-        public MessageRepositoryTests()
+        public MessageRepositoryCleanupTests()
         {
             _logger = Substitute.For<ILogger<MessageRepository>>();
             _connection = Substitute.For<IDbConnection>();
-            _transaction = Substitute.For<IDbTransaction>();
-            _transaction.Connection.Returns(_connection);
-            
             _sut = new MessageRepository(_connectionString, _logger);
         }
 
         [Fact]
-        public async Task IsMessageProcessedAsync_MessageExists_ShouldReturnTrue()
+        public async Task CleanupExpiredMessageContentAsync_WithExpiredMessages_ShouldReturnCleanedCount()
         {
             // Arrange
-            _connection.QuerySingleAsync<int>(Arg.Any<string>(), Arg.Any<object>(), Arg.Any<IDbTransaction>())
-                .Returns(1);
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            var batchSize = 500;
+            
+            // Mock zwróci 300 wyczyszczonych rekordów (mniej niż batch size)
+            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>())
+                .Returns(300);
 
             // Act
-            var result = await _sut.IsMessageProcessedAsync("test-id", _transaction);
+            var result = await _sut.CleanupExpiredMessageContentAsync(expiredBefore, batchSize);
 
             // Assert
-            result.ShouldBeTrue();
+            result.ShouldBe(300);
+            await _connection.Received(1).ExecuteAsync(Arg.Any<string>(), Arg.Any<object>()); // Tylko jedno wywołanie
         }
 
         [Fact]
-        public async Task IsMessageProcessedAsync_MessageNotExists_ShouldReturnFalse()
+        public async Task CleanupExpiredMessageContentAsync_FullBatch_ShouldReturnBatchSize()
         {
             // Arrange
-            _connection.QuerySingleAsync<int>(Arg.Any<string>(), Arg.Any<object>(), Arg.Any<IDbTransaction>())
-                .Returns(0);
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            var batchSize = 1000;
+            
+            // Mock zwróci pełny batch (1000 rekordów)
+            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>())
+                .Returns(1000);
 
             // Act
-            var result = await _sut.IsMessageProcessedAsync("test-id", _transaction);
+            var result = await _sut.CleanupExpiredMessageContentAsync(expiredBefore, batchSize);
 
             // Assert
-            result.ShouldBeFalse();
+            result.ShouldBe(1000);
+            await _connection.Received(1).ExecuteAsync(Arg.Any<string>(), Arg.Any<object>()); // Tylko jedno wywołanie
         }
 
         [Fact]
-        public async Task SaveMessageAsync_ValidMessage_ShouldExecuteSuccessfully()
+        public async Task CleanupExpiredMessageContentAsync_NoExpiredMessages_ShouldReturnZero()
         {
             // Arrange
-            var message = new ProcessedMessage
-            {
-                MessageId = "test-id",
-                QueueName = "test-queue",
-                Content = "test-content",
-                ProcessedAt = DateTime.UtcNow,
-                Status = "Processing"
-            };
-
-            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>(), Arg.Any<IDbTransaction>())
-                .Returns(1);
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>()).Returns(0);
 
             // Act
-            await _sut.SaveMessageAsync(message, _transaction);
+            var result = await _sut.CleanupExpiredMessageContentAsync(expiredBefore);
 
             // Assert
-            await _connection.Received(1).ExecuteAsync(Arg.Any<string>(), message, _transaction);
+            result.ShouldBe(0);
+            await _connection.Received(1).ExecuteAsync(Arg.Any<string>(), Arg.Any<object>());
         }
 
         [Fact]
-        public async Task SaveMessageAsync_NoRowsAffected_ShouldThrowException()
+        public async Task CleanupExpiredMessageContentAsync_DatabaseError_ShouldThrowAndLog()
         {
             // Arrange
-            var message = new ProcessedMessage { MessageId = "test-id" };
-            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>(), Arg.Any<IDbTransaction>())
-                .Returns(0);
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>())
+                .Throws(new InvalidOperationException("Database error"));
 
             // Act & Assert
             var exception = await Should.ThrowAsync<InvalidOperationException>(
-                () => _sut.SaveMessageAsync(message, _transaction));
+                () => _sut.CleanupExpiredMessageContentAsync(expiredBefore));
             
-            exception.Message.ShouldContain("Nie udało się zapisać wiadomości test-id");
+            exception.Message.ShouldBe("Database error");
         }
 
         [Fact]
-        public async Task UpdateMessageStatusAsync_ValidMessage_ShouldExecuteSuccessfully()
+        public async Task CleanupExpiredMessageContentAsync_DefaultBatchSize_ShouldUse1000()
         {
             // Arrange
-            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>(), Arg.Any<IDbTransaction>())
-                .Returns(1);
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            _connection.ExecuteAsync(Arg.Any<string>(), Arg.Any<object>()).Returns(0);
 
             // Act
-            await _sut.UpdateMessageStatusAsync("test-id", "Completed", _transaction);
+            await _sut.CleanupExpiredMessageContentAsync(expiredBefore);
 
             // Assert
             await _connection.Received(1).ExecuteAsync(
                 Arg.Any<string>(), 
-                Arg.Is<object>(x => x.GetType().GetProperty("MessageId")?.GetValue(x)?.ToString() == "test-id"), 
-                _transaction);
-        }
-    }
-
-    // ===== TESTY TRANSACTION SERVICE =====
-    public class TransactionServiceTests
-    {
-        private readonly string _connectionString = "test-connection-string";
-        private readonly ILogger<TransactionService> _logger;
-        private readonly TransactionService _sut;
-
-        public TransactionServiceTests()
-        {
-            _logger = Substitute.For<ILogger<TransactionService>>();
-            _sut = new TransactionService(_connectionString, _logger);
+                Arg.Is<object>(x => x.GetType().GetProperty("BatchSize")?.GetValue(x)?.ToString() == "1000"));
         }
 
         [Fact]
-        public void Constructor_NullConnectionString_ShouldThrowArgumentNullException()
+        public async Task GetExpiredMessageCountAsync_WithExpiredMessages_ShouldReturnCount()
+        {
+            // Arrange
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            _connection.QuerySingleAsync<int>(Arg.Any<string>(), Arg.Any<object>()).Returns(42);
+
+            // Act
+            var result = await _sut.GetExpiredMessageCountAsync(expiredBefore);
+
+            // Assert
+            result.ShouldBe(42);
+            await _connection.Received(1).QuerySingleAsync<int>(Arg.Any<string>(), Arg.Any<object>());
+        }
+
+        [Fact]
+        public async Task GetExpiredMessageCountAsync_NoExpiredMessages_ShouldReturnZero()
+        {
+            // Arrange
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            _connection.QuerySingleAsync<int>(Arg.Any<string>(), Arg.Any<object>()).Returns(0);
+
+            // Act
+            var result = await _sut.GetExpiredMessageCountAsync(expiredBefore);
+
+            // Assert
+            result.ShouldBe(0);
+        }
+
+        [Fact]
+        public async Task GetExpiredMessageCountAsync_DatabaseError_ShouldThrowAndLog()
+        {
+            // Arrange
+            var expiredBefore = DateTime.UtcNow.AddDays(-1);
+            _connection.QuerySingleAsync<int>(Arg.Any<string>(), Arg.Any<object>())
+                .Throws(new InvalidOperationException("Database connection failed"));
+
+            // Act & Assert
+            var exception = await Should.ThrowAsync<InvalidOperationException>(
+                () => _sut.GetExpiredMessageCountAsync(expiredBefore));
+            
+            exception.Message.ShouldBe("Database connection failed");
+        }
+    }
+
+    // ===== TESTY MESSAGE CLEANUP SERVICE =====
+    public class MessageCleanupServiceTests : IDisposable
+    {
+        private readonly IServiceProvider _serviceProvider;
+        private readonly IServiceScope _serviceScope;
+        private readonly IMessageRepository _messageRepository;
+        private readonly ILogger<MessageCleanupService> _logger;
+        private readonly IConfiguration _configuration;
+        private readonly MessageCleanupService _sut;
+        private readonly CancellationTokenSource _cancellationTokenSource;
+
+        public MessageCleanupServiceTests()
+        {
+            _messageRepository = Substitute.For<IMessageRepository>();
+            _logger = Substitute.For<ILogger<MessageCleanupService>>();
+            _configuration = Substitute.For<IConfiguration>();
+            _serviceScope = Substitute.For<IServiceScope>();
+            _serviceProvider = Substitute.For<IServiceProvider>();
+            _cancellationTokenSource = new CancellationTokenSource();
+
+            // Setup configuration defaults
+            _configuration.GetValue("MessageCleanup:Enabled", true).Returns(true);
+            _configuration.GetValue("MessageCleanup:IntervalHours", 24).Returns(24);
+            _configuration.GetValue("MessageCleanup:RetentionDays", 30).Returns(30);
+            _configuration.GetValue("MessageCleanup:BatchSize", 1000).Returns(1000);
+
+            // Setup service provider
+            _serviceProvider.CreateScope().Returns(_serviceScope);
+            _serviceScope.ServiceProvider.Returns(_serviceProvider);
+            _serviceProvider.GetRequiredService<IMessageRepository>().Returns(_messageRepository);
+
+            _sut = new MessageCleanupService(_serviceProvider, _logger, _configuration);
+        }
+
+        [Fact]
+        public void Constructor_ValidParameters_ShouldSetConfiguration()
+        {
+            // Act & Assert - Constructor should not throw
+            Should.NotThrow(() => new MessageCleanupService(_serviceProvider, _logger, _configuration));
+        }
+
+        [Fact]
+        public void Constructor_NullServiceProvider_ShouldThrowArgumentNullException()
         {
             // Act & Assert
-            Should.Throw<ArgumentNullException>(() => new TransactionService(null, _logger));
+            Should.Throw<ArgumentNullException>(() => 
+                new MessageCleanupService(null, _logger, _configuration));
         }
 
         [Fact]
         public void Constructor_NullLogger_ShouldThrowArgumentNullException()
         {
             // Act & Assert
-            Should.Throw<ArgumentNullException>(() => new TransactionService(_connectionString, null));
-        }
-
-        // Note: Full integration tests for TransactionService would require real DB connection
-        // These would be better suited for integration tests rather than unit tests
-    }
-
-    // ===== TESTY MESSAGE PUBLISHER =====
-    public class MessagePublisherServiceTests
-    {
-        private readonly IRabbitMqManager _rabbitMqManager;
-        private readonly ILogger<MessagePublisherService> _logger;
-        private readonly IModel _channel;
-        private readonly MessagePublisherService _sut;
-
-        public MessagePublisherServiceTests()
-        {
-            _rabbitMqManager = Substitute.For<IRabbitMqManager>();
-            _logger = Substitute.For<ILogger<MessagePublisherService>>();
-            _channel = Substitute.For<IModel>();
-
-            var basicProperties = Substitute.For<IBasicProperties>();
-            _channel.CreateBasicPropertiesWithHeaders(Arg.Any<MessageProperties>()).Returns(basicProperties);
-            _channel.WaitForConfirms(Arg.Any<TimeSpan>()).Returns(true);
-
-            _rabbitMqManager.GetChannelAsync(Arg.Any<string>()).Returns(_channel);
-
-            _sut = new MessagePublisherService(_rabbitMqManager, _logger);
+            Should.Throw<ArgumentNullException>(() => 
+                new MessageCleanupService(_serviceProvider, null, _configuration));
         }
 
         [Fact]
-        public async Task PublishAsync_ValidObject_ShouldSerializeAndPublish()
-        {
-            // Arrange
-            var testObject = new { Id = 1, Name = "Test" };
-
-            // Act
-            await _sut.PublishAsync("test.exchange", testObject);
-
-            // Assert
-            await _rabbitMqManager.Received(1).GetChannelAsync("publisher_test.exchange");
-            _channel.Received(1).ConfirmSelect();
-            _channel.Received(1).BasicPublish(
-                "test.exchange",
-                "",
-                Arg.Any<IBasicProperties>(),
-                Arg.Any<byte[]>());
-            _channel.Received(1).WaitForConfirms(Arg.Any<TimeSpan>());
-        }
-
-        [Fact]
-        public async Task PublishAsync_ValidString_ShouldPublish()
-        {
-            // Arrange
-            var message = "test message";
-
-            // Act
-            await _sut.PublishAsync("test.exchange", message);
-
-            // Assert
-            _channel.Received(1).BasicPublish(
-                "test.exchange",
-                "",
-                Arg.Any<IBasicProperties>(),
-                Arg.Is<byte[]>(x => Encoding.UTF8.GetString(x) == message));
-        }
-
-        [Fact]
-        public async Task PublishAsync_ValidBytes_ShouldPublish()
-        {
-            // Arrange
-            var messageBytes = Encoding.UTF8.GetBytes("test message");
-
-            // Act
-            await _sut.PublishAsync("test.exchange", messageBytes);
-
-            // Assert
-            _channel.Received(1).BasicPublish(
-                "test.exchange",
-                "",
-                Arg.Any<IBasicProperties>(),
-                messageBytes);
-        }
-
-        [Fact]
-        public async Task PublishAsync_WithCustomRoutingKey_ShouldUseRoutingKey()
-        {
-            // Arrange
-            var message = "test";
-            var routingKey = "test.routing.key";
-
-            // Act
-            await _sut.PublishAsync("test.exchange", message, routingKey: routingKey);
-
-            // Assert
-            _channel.Received(1).BasicPublish(
-                "test.exchange",
-                routingKey,
-                Arg.Any<IBasicProperties>(),
-                Arg.Any<byte[]>());
-        }
-
-        [Fact]
-        public async Task PublishAsync_WithCustomProperties_ShouldUseProperties()
-        {
-            // Arrange
-            var properties = new MessageProperties
-            {
-                MessageId = "custom-id",
-                CorrelationId = "custom-correlation",
-                ConfirmTimeout = TimeSpan.FromSeconds(10)
-            };
-
-            // Act
-            await _sut.PublishAsync("test.exchange", "test", properties);
-
-            // Assert
-            _channel.Received(1).CreateBasicPropertiesWithHeaders(properties);
-            _channel.Received(1).WaitForConfirms(TimeSpan.FromSeconds(10));
-        }
-
-        [Fact]
-        public async Task PublishAsync_NullMessage_ShouldThrowArgumentNullException()
+        public void Constructor_NullConfiguration_ShouldThrowArgumentNullException()
         {
             // Act & Assert
-            await Should.ThrowAsync<ArgumentNullException>(
-                () => _sut.PublishAsync<object>("test.exchange", null));
+            Should.Throw<ArgumentNullException>(() => 
+                new MessageCleanupService(_serviceProvider, _logger, null));
         }
 
         [Fact]
-        public async Task PublishAsync_EmptyExchangeName_ShouldThrowArgumentException()
-        {
-            // Act & Assert
-            await Should.ThrowAsync<ArgumentException>(
-                () => _sut.PublishAsync("", "test"));
-        }
-
-        [Fact]
-        public async Task PublishAsync_EmptyMessage_ShouldThrowArgumentException()
-        {
-            // Act & Assert
-            await Should.ThrowAsync<ArgumentException>(
-                () => _sut.PublishAsync("test.exchange", ""));
-        }
-
-        [Fact]
-        public async Task PublishAsync_WaitForConfirmsFails_ShouldThrowException()
+        public async Task ExecuteAsync_WhenDisabled_ShouldNotPerformCleanup()
         {
             // Arrange
-            _channel.WaitForConfirms(Arg.Any<TimeSpan>()).Returns(false);
+            _configuration.GetValue("MessageCleanup:Enabled", true).Returns(false);
+            var disabledService = new MessageCleanupService(_serviceProvider, _logger, _configuration);
+            _cancellationTokenSource.CancelAfter(100);
 
-            // Act & Assert
-            var exception = await Should.ThrowAsync<InvalidOperationException>(
-                () => _sut.PublishAsync("test.exchange", "test"));
+            // Act
+            await disabledService.StartAsync(_cancellationTokenSource.Token);
+            await Task.Delay(150);
+            await disabledService.StopAsync(_cancellationTokenSource.Token);
+
+            // Assert
+            await _messageRepository.DidNotReceive().GetExpiredMessageCountAsync(Arg.Any<DateTime>());
+            disabledService.Dispose();
+        }
+
+        [Fact]
+        public async Task PerformCleanupAsync_WithExpiredMessages_ShouldCleanupSuccessfully()
+        {
+            // Arrange
+            var expiredCount = 500;
+            var cleanedCount = 500;
             
-            exception.Message.ShouldContain("Timeout podczas oczekiwania na potwierdzenie");
-        }
+            _messageRepository.GetExpiredMessageCountAsync(Arg.Any<DateTime>()).Returns(expiredCount);
+            _messageRepository.CleanupExpiredMessageContentAsync(Arg.Any<DateTime>(), Arg.Any<int>()).Returns(cleanedCount);
 
-        [Fact]
-        public async Task PublishAsync_ChannelThrowsException_ShouldRetryAndRecreateChannel()
-        {
-            // Arrange
-            _channel.BasicPublish(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IBasicProperties>(), Arg.Any<byte[]>())
-                .Throws(new InvalidOperationException("Channel error"))
-                .AndDoes(_ => { }); // Success on second call
+            // Use reflection to call private method for testing
+            var method = typeof(MessageCleanupService).GetMethod("PerformCleanupAsync", 
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
             // Act
-            await _sut.PublishAsync("test.exchange", "test");
+            await (Task)method.Invoke(_sut, new object[] { _cancellationTokenSource.Token });
 
             // Assert
-            await _rabbitMqManager.Received(1).RecreateChannelAsync("publisher_test.exchange");
-            _channel.Received(2).BasicPublish(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IBasicProperties>(), Arg.Any<byte[]>());
+            await _messageRepository.Received(1).GetExpiredMessageCountAsync(Arg.Any<DateTime>());
+            await _messageRepository.Received(1).CleanupExpiredMessageContentAsync(Arg.Any<DateTime>(), 1000);
         }
 
         [Fact]
-        public async Task PublishAsync_AllRetriesFail_ShouldThrowException()
+        public async Task PerformCleanupAsync_NoExpiredMessages_ShouldSkipCleanup()
         {
             // Arrange
-            _channel.BasicPublish(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IBasicProperties>(), Arg.Any<byte[]>())
-                .Throws(new InvalidOperationException("Persistent error"));
+            _messageRepository.GetExpiredMessageCountAsync(Arg.Any<DateTime>()).Returns(0);
 
-            // Act & Assert
-            var exception = await Should.ThrowAsync<InvalidOperationException>(
-                () => _sut.PublishAsync("test.exchange", "test"));
-            
-            exception.Message.ShouldContain("Nie udało się opublikować wiadomości na exchange test.exchange po 3 próbach");
+            // Use reflection to call private method
+            var method = typeof(MessageCleanupService).GetMethod("PerformCleanupAsync", 
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            // Act
+            await (Task)method.Invoke(_sut, new object[] { _cancellationTokenSource.Token });
+
+            // Assert
+            await _messageRepository.Received(1).GetExpiredMessageCountAsync(Arg.Any<DateTime>());
+            await _messageRepository.DidNotReceive().CleanupExpiredMessageContentAsync(Arg.Any<DateTime>(), Arg.Any<int>());
         }
-    }
 
-    // ===== TESTY QUEUE CONSUMER SERVICE =====
-    public class QueueConsumerServiceTests : IDisposable
-    {
-        private readonly string _queueName = "test-queue";
-        private readonly IRabbitMqManager _rabbitMqManager;
-        private readonly IConfigLoader _configLoader;
-        private readonly IMessageRepository _messageRepository;
-        private readonly ITransactionService _transactionService;
-        private readonly ILogger<QueueConsumerService> _logger;
-        private readonly IServiceProvider _serviceProvider;
-        private readonly IModel _channel;
-        private readonly QueueConsumerService _sut;
-        private readonly CancellationTokenSource _cancellationTokenSource;
-
-        public QueueConsumerServiceTests()
+        [Fact]
+        public async Task PerformCleanupAsync_RepositoryThrowsException_ShouldLogErrorAndNotRethrow()
         {
-            _rabbitMqManager = Substitute.For<IRabbitMqManager>();
-            _configLoader = Substitute.For<IConfigLoader>();
-            _messageRepository = Substitute.For<IMessageRepository>();
-            _transactionService = Substitute.For<ITransactionService>();
-            _logger = Substitute.For<ILogger<QueueConsumerService>>();
-            _serviceProvider = Substitute.For<IServiceProvider>();
-            _channel = Substitute.For<IModel>();
-            _cancellationTokenSource = new CancellationTokenSource();
+            // Arrange
+            _messageRepository.GetExpiredMessageCountAsync(Arg.Any<DateTime>())
+                .Throws(new InvalidOperationException("Database error"));
 
-            var queueConfig = new QueueConfig
+            // Use reflection to call private method
+            var method = typeof(MessageCleanupService).GetMethod("PerformCleanupAsync", 
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            // Act & Assert - Should not throw
+            await Should.NotThrowAsync(async () => 
+                await (Task)method.Invoke(_sut, new object[] { _cancellationTokenSource.Token }));
+        }
+
+        [Fact]
+        public async Task PerformCleanupAsync_CancellationRequested_ShouldHandleGracefully()
+        {
+            // Arrange
+            _cancellationTokenSource.Cancel(); // Cancel immediately
+            _messageRepository.GetExpiredMessageCountAsync(Arg.Any<DateTime>())
+                .Returns(Task.FromCanceled<int>(_cancellationTokenSource.Token));
+
+            // Use reflection to call private method
+            var method = typeof(MessageCleanupService).GetMethod("PerformCleanupAsync", 
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            // Act & Assert - Should handle cancellation gracefully
+            await Should.NotThrowAsync(async () => 
+                await (Task)method.Invoke(_sut, new object[] { _cancellationTokenSource.Token }));
+        }
+
+        [Fact]
+        public void Constructor_CustomConfiguration_ShouldUseCustomValues()
+        {
+            // Arrange
+            _configuration.GetValue("MessageCleanup:Enabled", true).Returns(false);
+            _configuration.GetValue("MessageCleanup:IntervalHours", 24).Returns(12);
+            _configuration.GetValue("MessageCleanup:RetentionDays", 30).Returns(7);
+            _configuration.GetValue("MessageCleanup:BatchSize", 1000).Returns(500);
+
+            // Act
+            var customService = new MessageCleanupService(_serviceProvider, _logger, _configuration);
+
+            // Assert - Constructor should complete successfully with custom config
+            customService.ShouldNotBeNull();
+            customService.Dispose();
+        }
+
+        [Fact]
+        public void Dispose_ShouldNotThrow()
+        {
+            // Act & Assert
+            Should.NotThrow(() => _sut.Dispose());
+        }
+
+        [Fact]
+        public void Dispose_CalledMultipleTimes_ShouldNotThrow()
+        {
+            // Act & Assert
+            Should.NotThrow(() =>
             {
-                QueueName = _queueName,
-                Durable = true,
-                PrefetchCount = 10,
-                RetryDelayMs = 1000
-            };
-
-            _configLoader.GetQueueConfigAsync(_queueName).Returns(queueConfig);
-            _rabbitMqManager.GetChannelAsync(_queueName).Returns(_channel);
-            _rabbitMqManager.IsConnected.Returns(true);
-            _channel.IsOpen.Returns(true);
-
-            _sut = new QueueConsumerService(
-                _queueName,
-                _rabbitMqManager,
-                _configLoader,
-                _messageRepository,
-                _transactionService,
-                _logger,
-                _serviceProvider);
-        }
-
-        [Fact]
-        public void Constructor_NullQueueName_ShouldThrowArgumentNullException()
-        {
-            // Act & Assert
-            Should.Throw<ArgumentNullException>(() => new QueueConsumerService(
-                null, _rabbitMqManager, _configLoader, _messageRepository, 
-                _transactionService, _logger, _serviceProvider));
-        }
-
-        [Fact]
-        public void Constructor_NullRabbitMqManager_ShouldThrowArgumentNullException()
-        {
-            // Act & Assert
-            Should.Throw<ArgumentNullException>(() => new QueueConsumerService(
-                _queueName, null, _configLoader, _messageRepository, 
-                _transactionService, _logger, _serviceProvider));
-        }
-
-        [Fact]
-        public async Task ExecuteAsync_ConfigLoadFails_ShouldLogErrorAndReturn()
-        {
-            // Arrange
-            _configLoader.GetQueueConfigAsync(_queueName)
-                .Throws(new InvalidOperationException("Config error"));
-
-            // Act
-            await _sut.StartAsync(_cancellationTokenSource.Token);
-            _cancellationTokenSource.Cancel();
-            await _sut.StopAsync(_cancellationTokenSource.Token);
-
-            // Assert
-            _logger.Received().LogError(
-                Arg.Any<Exception>(), 
-                "Nie udało się załadować konfiguracji dla kolejki {QueueName}", 
-                _queueName);
-        }
-
-        [Fact]
-        public async Task ExecuteAsync_SuccessfulStart_ShouldDeclareQueueAndCreateConsumer()
-        {
-            // Arrange
-            _cancellationTokenSource.CancelAfter(100); // Cancel quickly for test
-
-            // Act
-            await _sut.StartAsync(_cancellationTokenSource.Token);
-            await Task.Delay(150); // Let it run briefly
-            await _sut.StopAsync(_cancellationTokenSource.Token);
-
-            // Assert
-            _channel.Received().QueueDeclare(
-                _queueName,
-                true, // durable
-                false, // exclusive
-                false, // autoDelete
-                Arg.Any<IDictionary<string, object>>());
-
-            _channel.Received().BasicQos(0, 10, false); // prefetch count
-            _channel.Received().BasicConsume(
-                _queueName,
-                false, // autoAck
-                Arg.Any<IBasicConsumer>());
+                _sut.Dispose();
+                _sut.Dispose(); // Second call should not throw
+            });
         }
 
         public void Dispose()
@@ -743,447 +607,11 @@ namespace RabbitMQ.Tests
         }
     }
 
-    // ===== TESTY QUEUE CONSUMER MANAGER =====
-    public class QueueConsumerManagerTests
-    {
-        private readonly IConfigLoader _configLoader;
-        private readonly IQueueConsumerFactory _consumerFactory;
-        private readonly ILogger<QueueConsumerManager> _logger;
-        private readonly QueueConsumerManager _sut;
-
-        public QueueConsumerManagerTests()
-        {
-            _configLoader = Substitute.For<IConfigLoader>();
-            _consumerFactory = Substitute.For<IQueueConsumerFactory>();
-            _logger = Substitute.For<ILogger<QueueConsumerManager>>();
-
-            _sut = new QueueConsumerManager(_configLoader, _consumerFactory, _logger);
-        }
-
-        [Fact]
-        public async Task ExecuteAsync_WithQueues_ShouldCreateConsumersForEachQueue()
-        {
-            // Arrange
-            var queueNames = new[] { "queue1", "queue2", "queue3" };
-            _configLoader.GetAllQueueNamesAsync().Returns(queueNames);
-
-            var consumer1 = Substitute.For<QueueConsumerService>("queue1", null, null, null, null, null, null);
-            var consumer2 = Substitute.For<QueueConsumerService>("queue2", null, null, null, null, null, null);
-            var consumer3 = Substitute.For<QueueConsumerService>("queue3", null, null, null, null, null, null);
-
-            _consumerFactory.CreateConsumer("queue1").Returns(consumer1);
-            _consumerFactory.CreateConsumer("queue2").Returns(consumer2);
-            _consumerFactory.CreateConsumer("queue3").Returns(consumer3);
-
-            using var cancellationTokenSource = new CancellationTokenSource();
-            cancellationTokenSource.CancelAfter(100);
-
-            // Act
-            await _sut.StartAsync(cancellationTokenSource.Token);
-            await Task.Delay(150);
-            await _sut.StopAsync(cancellationTokenSource.Token);
-
-            // Assert
-            _consumerFactory.Received(1).CreateConsumer("queue1");
-            _consumerFactory.Received(1).CreateConsumer("queue2");
-            _consumerFactory.Received(1).CreateConsumer("queue3");
-        }
-    }
-
-    // ===== TESTY QUEUE CONSUMER FACTORY =====
-    public class QueueConsumerFactoryTests
-    {
-        private readonly IServiceProvider _serviceProvider;
-        private readonly IRabbitMqManager _rabbitMqManager;
-        private readonly IConfigLoader _configLoader;
-        private readonly IMessageRepository _messageRepository;
-        private readonly ITransactionService _transactionService;
-        private readonly ILogger<QueueConsumerService> _logger;
-        private readonly QueueConsumerFactory _sut;
-
-        public QueueConsumerFactoryTests()
-        {
-            _serviceProvider = Substitute.For<IServiceProvider>();
-            _rabbitMqManager = Substitute.For<IRabbitMqManager>();
-            _configLoader = Substitute.For<IConfigLoader>();
-            _messageRepository = Substitute.For<IMessageRepository>();
-            _transactionService = Substitute.For<ITransactionService>();
-            _logger = Substitute.For<ILogger<QueueConsumerService>>();
-
-            _serviceProvider.GetRequiredService<IRabbitMqManager>().Returns(_rabbitMqManager);
-            _serviceProvider.GetRequiredService<IConfigLoader>().Returns(_configLoader);
-            _serviceProvider.GetRequiredService<IMessageRepository>().Returns(_messageRepository);
-            _serviceProvider.GetRequiredService<ITransactionService>().Returns(_transactionService);
-            _serviceProvider.GetRequiredService<ILogger<QueueConsumerService>>().Returns(_logger);
-
-            _sut = new QueueConsumerFactory(_serviceProvider);
-        }
-
-        [Fact]
-        public void CreateConsumer_ValidQueueName_ShouldReturnQueueConsumerService()
-        {
-            // Act
-            var result = _sut.CreateConsumer("test-queue");
-
-            // Assert
-            result.ShouldNotBeNull();
-            result.ShouldBeOfType<QueueConsumerService>();
-        }
-
-        [Fact]
-        public void CreateConsumer_CallsServiceProvider_ShouldResolveAllDependencies()
-        {
-            // Act
-            _sut.CreateConsumer("test-queue");
-
-            // Assert
-            _serviceProvider.Received(1).GetRequiredService<IRabbitMqManager>();
-            _serviceProvider.Received(1).GetRequiredService<IConfigLoader>();
-            _serviceProvider.Received(1).GetRequiredService<IMessageRepository>();
-            _serviceProvider.Received(1).GetRequiredService<ITransactionService>();
-            _serviceProvider.Received(1).GetRequiredService<ILogger<QueueConsumerService>>();
-        }
-    }
-
-    // ===== TESTY EXTENSION METHODS =====
-    public class MessagePublisherExtensionsTests
-    {
-        private readonly IMessagePublisher _publisher;
-
-        public MessagePublisherExtensionsTests()
-        {
-            _publisher = Substitute.For<IMessagePublisher>();
-        }
-
-        [Fact]
-        public async Task PublishOrderEventAsync_ValidOrder_ShouldCallPublishWithCorrectParameters()
-        {
-            // Arrange
-            var order = new { OrderId = "123", Amount = 100.50m };
-            var correlationId = "test-correlation";
-
-            // Act
-            await _publisher.PublishOrderEventAsync(order, correlationId, "order.created");
-
-            // Assert
-            await _publisher.Received(1).PublishAsync(
-                "orders.exchange",
-                order,
-                Arg.Is<MessageProperties>(p => 
-                    p.CorrelationId == correlationId &&
-                    p.Headers.ContainsKey("MessageType") &&
-                    p.Headers.ContainsKey("EventType") &&
-                    p.Headers.ContainsKey("PublishedAt")),
-                "order.created");
-        }
-
-        [Fact]
-        public async Task PublishNotificationEventAsync_ValidNotification_ShouldCallPublishWithCorrectParameters()
-        {
-            // Arrange
-            var notification = new { Message = "Test notification", UserId = "user123" };
-            var userId = "user123";
-
-            // Act
-            await _publisher.PublishNotificationEventAsync(notification, userId, "user.notification");
-
-            // Assert
-            await _publisher.Received(1).PublishAsync(
-                "notifications.exchange",
-                notification,
-                Arg.Is<MessageProperties>(p => 
-                    p.Headers.ContainsKey("MessageType") &&
-                    p.Headers.ContainsKey("UserId") &&
-                    p.ConfirmTimeout == TimeSpan.FromSeconds(10)),
-                "user.notification");
-        }
-
-        [Fact]
-        public async Task PublishEventAsync_WithAdditionalHeaders_ShouldMergeHeaders()
-        {
-            // Arrange
-            var eventData = new { EventId = "event123" };
-            var additionalHeaders = new Dictionary<string, object>
-            {
-                ["CustomHeader1"] = "Value1",
-                ["CustomHeader2"] = "Value2"
-            };
-
-            // Act
-            await _publisher.PublishEventAsync("test.exchange", eventData, 
-                TimeSpan.FromSeconds(15), additionalHeaders, "test.routing");
-
-            // Assert
-            await _publisher.Received(1).PublishAsync(
-                "test.exchange",
-                eventData,
-                Arg.Is<MessageProperties>(p => 
-                    p.ConfirmTimeout == TimeSpan.FromSeconds(15) &&
-                    p.Headers.ContainsKey("CustomHeader1") &&
-                    p.Headers.ContainsKey("CustomHeader2") &&
-                    p.Headers.ContainsKey("MessageType") &&
-                    p.Headers.ContainsKey("EventType")),
-                "test.routing");
-        }
-    }
-
-    // ===== TESTY CHANNEL EXTENSIONS =====
-    public class ChannelExtensionsTests
-    {
-        private readonly IModel _channel;
-        private readonly IBasicProperties _basicProperties;
-
-        public ChannelExtensionsTests()
-        {
-            _channel = Substitute.For<IModel>();
-            _basicProperties = Substitute.For<IBasicProperties>();
-            _channel.CreateBasicProperties().Returns(_basicProperties);
-        }
-
-        [Fact]
-        public void CreateBasicPropertiesWithHeaders_MessageProperties_ShouldSetAllProperties()
-        {
-            // Arrange
-            var messageProperties = new MessageProperties
-            {
-                MessageId = "test-id",
-                CorrelationId = "test-correlation",
-                ReplyTo = "test-reply",
-                DeliveryMode = 2,
-                ContentType = "application/json",
-                ContentEncoding = "utf-8",
-                Priority = 5,
-                Expiration = DateTime.UtcNow.AddHours(1),
-                Headers = new Dictionary<string, object>
-                {
-                    ["CustomHeader"] = "CustomValue"
-                }
-            };
-
-            // Act
-            var result = _channel.CreateBasicPropertiesWithHeaders(messageProperties);
-
-            // Assert
-            result.ShouldBe(_basicProperties);
-            _basicProperties.MessageId.ShouldBe("test-id");
-            _basicProperties.CorrelationId.ShouldBe("test-correlation");
-            _basicProperties.ReplyTo.ShouldBe("test-reply");
-            _basicProperties.DeliveryMode.ShouldBe((byte)2);
-            _basicProperties.Persistent.ShouldBeTrue();
-            _basicProperties.ContentType.ShouldBe("application/json");
-            _basicProperties.ContentEncoding.ShouldBe("utf-8");
-            _basicProperties.Priority.ShouldBe((byte)5);
-            _basicProperties.Headers.ShouldContainKey("CustomHeader");
-            _basicProperties.Headers["CustomHeader"].ShouldBe("CustomValue");
-        }
-
-        [Fact]
-        public void CreateBasicPropertiesWithHeaders_GenericEvent_ShouldSetTypeHeaders()
-        {
-            // Arrange
-            var testEvent = new TestEvent { Id = "123", Name = "Test" };
-
-            // Act
-            var result = _channel.CreateBasicPropertiesWithHeaders(testEvent);
-
-            // Assert
-            result.ShouldBe(_basicProperties);
-            _basicProperties.Persistent.ShouldBeTrue();
-            _basicProperties.DeliveryMode.ShouldBe((byte)2);
-            _basicProperties.ContentType.ShouldBe("application/json");
-            _basicProperties.Headers.ShouldContainKey("MessageType");
-            _basicProperties.Headers["MessageType"].ShouldBe("TestEvent");
-            _basicProperties.Headers.ShouldContainKey("AssemblyQualifiedName");
-            _basicProperties.Headers.ShouldContainKey("PublishedAt");
-            _basicProperties.Headers.ShouldContainKey("MachineName");
-        }
-
-        [Fact]
-        public void CreateBasicPropertiesWithHeaders_NullHeaders_ShouldNotThrow()
-        {
-            // Arrange
-            var messageProperties = new MessageProperties
-            {
-                Headers = null
-            };
-
-            // Act & Assert
-            Should.NotThrow(() => _channel.CreateBasicPropertiesWithHeaders(messageProperties));
-        }
-
-        [Fact]
-        public void CreateBasicPropertiesWithHeaders_EmptyHeaders_ShouldNotSetHeaders()
-        {
-            // Arrange
-            var messageProperties = new MessageProperties
-            {
-                Headers = new Dictionary<string, object>()
-            };
-
-            // Act
-            _channel.CreateBasicPropertiesWithHeaders(messageProperties);
-
-            // Assert
-            _basicProperties.DidNotReceive().Headers = Arg.Any<IDictionary<string, object>>();
-        }
-    }
-
-    // ===== TESTY MODELI =====
-    public class MessagePropertiesTests
+    // ===== TESTY INTEGRATION SERVICE REGISTRATION =====
+    public class MessageCleanupServiceRegistrationTests
     {
         [Fact]
-        public void Constructor_ShouldSetDefaultValues()
-        {
-            // Act
-            var properties = new MessageProperties();
-
-            // Assert
-            properties.MessageId.ShouldNotBeNullOrEmpty();
-            properties.DeliveryMode.ShouldBe((byte)2);
-            properties.ContentType.ShouldBe("application/json");
-            properties.ContentEncoding.ShouldBe("utf-8");
-            properties.Headers.ShouldNotBeNull();
-            properties.Priority.ShouldBe((byte)0);
-            properties.ConfirmTimeout.ShouldBe(TimeSpan.FromSeconds(5));
-        }
-
-        [Fact]
-        public void MessageId_ShouldBeUniqueForEachInstance()
-        {
-            // Act
-            var properties1 = new MessageProperties();
-            var properties2 = new MessageProperties();
-
-            // Assert
-            properties1.MessageId.ShouldNotBe(properties2.MessageId);
-        }
-    }
-
-    public class QueueConfigTests
-    {
-        [Fact]
-        public void Constructor_ShouldSetDefaultValues()
-        {
-            // Act
-            var config = new QueueConfig();
-
-            // Assert
-            config.Durable.ShouldBeTrue();
-            config.Exclusive.ShouldBeFalse();
-            config.AutoDelete.ShouldBeFalse();
-            config.PrefetchCount.ShouldBe((ushort)10);
-            config.RetryDelayMs.ShouldBe(5000);
-            config.Arguments.ShouldNotBeNull();
-        }
-    }
-
-    public class ProcessedMessageTests
-    {
-        [Fact]
-        public void ProcessedMessage_ShouldAllowSettingAllProperties()
-        {
-            // Arrange
-            var now = DateTime.UtcNow;
-
-            // Act
-            var message = new ProcessedMessage
-            {
-                MessageId = "test-id",
-                QueueName = "test-queue",
-                Content = "test-content",
-                ProcessedAt = now,
-                Status = "Completed"
-            };
-
-            // Assert
-            message.MessageId.ShouldBe("test-id");
-            message.QueueName.ShouldBe("test-queue");
-            message.Content.ShouldBe("test-content");
-            message.ProcessedAt.ShouldBe(now);
-            message.Status.ShouldBe("Completed");
-        }
-    }
-
-    // ===== TESTY WYJĄTKÓW =====
-    public class DuplicateMessageExceptionTests
-    {
-        [Fact]
-        public void Constructor_WithMessage_ShouldSetMessage()
-        {
-            // Arrange
-            var message = "Duplicate message detected";
-
-            // Act
-            var exception = new DuplicateMessageException(message);
-
-            // Assert
-            exception.Message.ShouldBe(message);
-            exception.ShouldBeOfType<DuplicateMessageException>();
-        }
-    }
-
-    public class ConnectionEventArgsTests
-    {
-        [Fact]
-        public void Constructor_ShouldSetDefaultTimestamp()
-        {
-            // Arrange
-            var before = DateTime.UtcNow;
-
-            // Act
-            var args = new ConnectionEventArgs { Reason = "Test reason" };
-
-            // Assert
-            var after = DateTime.UtcNow;
-            args.Reason.ShouldBe("Test reason");
-            args.Timestamp.ShouldBeGreaterThanOrEqualTo(before);
-            args.Timestamp.ShouldBeLessThanOrEqualTo(after);
-        }
-    }
-
-    // ===== TESTY INTEGRACYJNE DI =====
-    public class ServiceCollectionExtensionsTests
-    {
-        [Fact]
-        public void AddRabbitMq_ShouldRegisterConnectionFactory()
-        {
-            // Arrange
-            var services = new ServiceCollection();
-
-            // Act
-            services.AddRabbitMq(factory =>
-            {
-                factory.HostName = "localhost";
-                factory.Port = 5672;
-            });
-
-            // Assert
-            var serviceProvider = services.BuildServiceProvider();
-            var connectionFactory = serviceProvider.GetService<IConnectionFactory>();
-            connectionFactory.ShouldNotBeNull();
-            connectionFactory.HostName.ShouldBe("localhost");
-            connectionFactory.Port.ShouldBe(5672);
-        }
-
-        [Fact]
-        public void AddRabbitMq_ShouldRegisterRabbitMqManager()
-        {
-            // Arrange
-            var services = new ServiceCollection();
-            services.AddLogging();
-
-            // Act
-            services.AddRabbitMq(factory => { });
-
-            // Assert
-            var serviceProvider = services.BuildServiceProvider();
-            var rabbitMqManager = serviceProvider.GetService<IRabbitMqManager>();
-            rabbitMqManager.ShouldNotBeNull();
-            rabbitMqManager.ShouldBeOfType<RabbitMqManager>();
-        }
-
-        [Fact]
-        public void AddMessageProcessing_ShouldRegisterAllServices()
+        public void AddMessageProcessing_ShouldRegisterCleanupService()
         {
             // Arrange
             var services = new ServiceCollection();
@@ -1195,222 +623,356 @@ namespace RabbitMQ.Tests
 
             // Assert
             var serviceProvider = services.BuildServiceProvider();
-            
-            serviceProvider.GetService<IMessageRepository>().ShouldNotBeNull();
-            serviceProvider.GetService<ITransactionService>().ShouldNotBeNull();
-            serviceProvider.GetService<IConfigLoader>().ShouldNotBeNull();
-            serviceProvider.GetService<IQueueConsumerFactory>().ShouldNotBeNull();
-            serviceProvider.GetService<IMessagePublisher>().ShouldNotBeNull();
-            
-            // Verify hosted service is registered
             var hostedServices = serviceProvider.GetServices<IHostedService>();
-            hostedServices.ShouldContain(s => s.GetType() == typeof(QueueConsumerManager));
+            
+            hostedServices.ShouldContain(s => s.GetType() == typeof(MessageCleanupService));
         }
     }
 
-    // ===== POMOCNICZE KLASY TESTOWE =====
-    public class TestEvent
-    {
-        public string Id { get; set; }
-        public string Name { get; set; }
-    }
-
-    // ===== TESTY PERFORMANCE I EDGE CASES =====
-    public class RabbitMqManagerPerformanceTests
+    // ===== TESTY MODELU Z NOWYM POLEM =====
+    public class ProcessedMessageWithValidToTests
     {
         [Fact]
-        public async Task GetChannelAsync_ConcurrentCalls_ShouldHandleRaceConditions()
+        public void ProcessedMessage_WithValidTo_ShouldAllowSettingProperty()
         {
             // Arrange
-            var connectionFactory = Substitute.For<IConnectionFactory>();
-            var connection = Substitute.For<IConnection>();
-            var channel = Substitute.For<IModel>();
-            var logger = Substitute.For<ILogger<RabbitMqManager>>();
-
-            connectionFactory.CreateConnection().Returns(connection);
-            connection.IsOpen.Returns(true);
-            connection.CreateModel().Returns(channel);
-            channel.IsOpen.Returns(true);
-
-            using var manager = new RabbitMqManager(connectionFactory, logger);
-
-            // Act - Simulate concurrent access
-            var tasks = Enumerable.Range(0, 10)
-                .Select(_ => Task.Run(() => manager.GetChannelAsync("test-queue")))
-                .ToArray();
-
-            var results = await Task.WhenAll(tasks);
-
-            // Assert
-            results.ShouldAllBe(r => r == channel);
-            connection.Received(1).CreateModel(); // Should create only one channel despite concurrent calls
-        }
-
-        [Fact]
-        public async Task GetChannelAsync_ManyDifferentQueues_ShouldCreateSeparateChannels()
-        {
-            // Arrange
-            var connectionFactory = Substitute.For<IConnectionFactory>();
-            var connection = Substitute.For<IConnection>();
-            var logger = Substitute.For<ILogger<RabbitMqManager>>();
-
-            connectionFactory.CreateConnection().Returns(connection);
-            connection.IsOpen.Returns(true);
-
-            var channels = Enumerable.Range(0, 100)
-                .Select(_ => {
-                    var ch = Substitute.For<IModel>();
-                    ch.IsOpen.Returns(true);
-                    return ch;
-                })
-                .ToArray();
-
-            connection.CreateModel().Returns(channels[0], channels.Skip(1).ToArray());
-
-            using var manager = new RabbitMqManager(connectionFactory, logger);
+            var validTo = DateTime.UtcNow.AddDays(7);
 
             // Act
-            var results = new List<IModel>();
-            for (int i = 0; i < 100; i++)
+            var message = new ProcessedMessage
             {
-                results.Add(await manager.GetChannelAsync($"queue-{i}"));
-            }
+                MessageId = "test-id",
+                QueueName = "test-queue",
+                Content = "test-content",
+                ProcessedAt = DateTime.UtcNow,
+                Status = "Completed",
+                ValidTo = validTo
+            };
 
             // Assert
-            results.Count.ShouldBe(100);
-            results.Distinct().Count().ShouldBe(100); // All channels should be different
-            connection.Received(100).CreateModel();
-        }
-    }
-
-    // ===== TESTY EDGE CASES PUBLISHER =====
-    public class MessagePublisherEdgeCaseTests
-    {
-        [Fact]
-        public async Task PublishAsync_VeryLargeMessage_ShouldHandle()
-        {
-            // Arrange
-            var rabbitMqManager = Substitute.For<IRabbitMqManager>();
-            var logger = Substitute.For<ILogger<MessagePublisherService>>();
-            var channel = Substitute.For<IModel>();
-            var basicProperties = Substitute.For<IBasicProperties>();
-
-            channel.CreateBasicPropertiesWithHeaders(Arg.Any<MessageProperties>()).Returns(basicProperties);
-            channel.WaitForConfirms(Arg.Any<TimeSpan>()).Returns(true);
-            rabbitMqManager.GetChannelAsync(Arg.Any<string>()).Returns(channel);
-
-            var publisher = new MessagePublisherService(rabbitMqManager, logger);
-
-            // Create large message (1MB)
-            var largeMessage = new string('x', 1024 * 1024);
-
-            // Act & Assert - Should not throw
-            await Should.NotThrowAsync(() => publisher.PublishAsync("test.exchange", largeMessage));
+            message.ValidTo.ShouldBe(validTo);
+            message.ValidTo.HasValue.ShouldBeTrue();
         }
 
         [Fact]
-        public async Task PublishAsync_SpecialCharacters_ShouldHandle()
+        public void ProcessedMessage_WithNullValidTo_ShouldAllowNullValue()
         {
-            // Arrange
-            var rabbitMqManager = Substitute.For<IRabbitMqManager>();
-            var logger = Substitute.For<ILogger<MessagePublisherService>>();
-            var channel = Substitute.For<IModel>();
-            var basicProperties = Substitute.For<IBasicProperties>();
-
-            channel.CreateBasicPropertiesWithHeaders(Arg.Any<MessageProperties>()).Returns(basicProperties);
-            channel.WaitForConfirms(Arg.Any<TimeSpan>()).Returns(true);
-            rabbitMqManager.GetChannelAsync(Arg.Any<string>()).Returns(channel);
-
-            var publisher = new MessagePublisherService(rabbitMqManager, logger);
-
-            // Message with special characters
-            var specialMessage = "Test with émojis 🚀 and ñ characters ànd ümlauts";
-
-            // Act & Assert - Should not throw
-            await Should.NotThrowAsync(() => publisher.PublishAsync("test.exchange", specialMessage));
-
-            // Verify the message was properly encoded
-            channel.Received(1).BasicPublish(
-                "test.exchange",
-                "",
-                Arg.Any<IBasicProperties>(),
-                Arg.Is<byte[]>(bytes => Encoding.UTF8.GetString(bytes) == specialMessage));
-        }
-    }
-
-    // ===== TESTY MEMORY LEAKS I DISPOSAL =====
-    public class DisposalTests
-    {
-        [Fact]
-        public void RabbitMqManager_Dispose_ShouldCleanupAllResources()
-        {
-            // Arrange
-            var connectionFactory = Substitute.For<IConnectionFactory>();
-            var connection = Substitute.For<IConnection>();
-            var channel1 = Substitute.For<IModel>();
-            var channel2 = Substitute.For<IModel>();
-            var logger = Substitute.For<ILogger<RabbitMqManager>>();
-
-            connectionFactory.CreateConnection().Returns(connection);
-            connection.IsOpen.Returns(true);
-            connection.CreateModel().Returns(channel1, channel2);
-            channel1.IsOpen.Returns(true);
-            channel2.IsOpen.Returns(true);
-
-            var manager = new RabbitMqManager(connectionFactory, logger);
-
-            // Create some channels
-            _ = manager.GetChannelAsync("queue1").Result;
-            _ = manager.GetChannelAsync("queue2").Result;
-
             // Act
-            manager.Dispose();
-
-            // Assert
-            channel1.Received(1).Close();
-            channel1.Received(1).Dispose();
-            channel2.Received(1).Close();
-            channel2.Received(1).Dispose();
-            connection.Received(1).Close();
-            connection.Received(1).Dispose();
-        }
-
-        [Fact]
-        public void RabbitMqManager_DoubleDispose_ShouldNotThrow()
-        {
-            // Arrange
-            var connectionFactory = Substitute.For<IConnectionFactory>();
-            var logger = Substitute.For<ILogger<RabbitMqManager>>();
-            var manager = new RabbitMqManager(connectionFactory, logger);
-
-            // Act & Assert
-            Should.NotThrow(() =>
+            var message = new ProcessedMessage
             {
-                manager.Dispose();
-                manager.Dispose(); // Second dispose should not throw
-            });
-        }
+                MessageId = "test-id",
+                ValidTo = null
+            };
 
-        [Fact]
-        public void QueueConsumerService_Dispose_ShouldUnsubscribeFromEvents()
-        {
-            // Arrange
-            var rabbitMqManager = Substitute.For<IRabbitMqManager>();
-            var configLoader = Substitute.For<IConfigLoader>();
-            var messageRepository = Substitute.For<IMessageRepository>();
-            var transactionService = Substitute.For<ITransactionService>();
-            var logger = Substitute.For<ILogger<QueueConsumerService>>();
-            var serviceProvider = Substitute.For<IServiceProvider>();
-
-            var consumer = new QueueConsumerService(
-                "test-queue", rabbitMqManager, configLoader, messageRepository, 
-                transactionService, logger, serviceProvider);
-
-            // Act
-            consumer.Dispose();
-
-            // Assert - Events should be unsubscribed (hard to test directly, but Dispose should not throw)
-            Should.NotThrow(() => consumer.Dispose());
+            // Assert
+            message.ValidTo.ShouldBeNull();
+            message.ValidTo.HasValue.ShouldBeFalse();
         }
     }
 }
+
+/*
+Przykład konfiguracji w appsettings.json:
+
+{
+  "MessageCleanup": {
+    "Enabled": true,
+    "IntervalHours": 24,      // Jak często uruchamiać
+    "RetentionDays": 30,      // Ile dni zachowywać Content
+    "BatchSize": 1000         // Ile rekordów na raz
+  }
+}
+
+SQL do aktualizacji tabeli:
+
+ALTER TABLE ProcessedMessages 
+ADD ValidTo DATETIME2 NULL;
+
+CREATE INDEX IX_ProcessedMessages_ValidTo_Content 
+ON ProcessedMessages (ValidTo) 
+WHERE Content IS NOT NULL;
+
+Przykład użycia w Program.cs:
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Dodaj wszystkie serwisy (automatycznie doda MessageCleanupService)
+builder.Services.AddMessageProcessing(sqlConnectionString);
+
+var app = builder.Build();
+app.Run();
+
+Przykład ustawiania ValidTo przy zapisywaniu wiadomości:
+
+public async Task ProcessMessageWithTransaction(BasicDeliverEventArgs ea, string messageId)
+{
+    var body = ea.Body.ToArray();
+    var messageContent = Encoding.UTF8.GetString(body);
+
+    await _transactionService.ExecuteInTransactionAsync(async transaction =>
+    {
+        var isProcessed = await _messageRepository.IsMessageProcessedAsync(messageId, transaction);
+        if (isProcessed)
+        {
+            throw new DuplicateMessageException($"Wiadomość {messageId} została już przetworzona");
+        }
+
+        var processedMessage = new ProcessedMessage
+        {
+            MessageId = messageId,
+            QueueName = _queueName,
+            Content = messageContent,
+            ProcessedAt = DateTime.UtcNow,
+            Status = "Processing",
+            ValidTo = DateTime.UtcNow.AddDays(30) // Zawartość ważna przez 30 dni
+        };
+
+        await _messageRepository.SaveMessageAsync(processedMessage, transaction);
+        await ProcessBusinessLogic(messageContent, messageId, transaction);
+        await _messageRepository.UpdateMessageStatusAsync(messageId, "Completed", transaction);
+    });
+}
+
+Monitorowanie cleanup przez logi:
+
+2024-01-15 02:00:00.123 [INF] MessageCleanupService rozpoczął pracę
+2024-01-15 02:00:01.456 [INF] Znaleziono 2,500 wiadomości do wyczyszczenia (starszych niż 2023-12-15 02:00:01)
+2024-01-15 02:00:02.789 [DBG] Wyczyszczono 1000 wiadomości w batch, łącznie: 1000
+2024-01-15 02:00:03.012 [DBG] Wyczyszczono 1000 wiadomości w batch, łącznie: 2000  
+2024-01-15 02:00:03.234 [DBG] Wyczyszczono 500 wiadomości w batch, łącznie: 2500
+2024-01-15 02:00:03.456 [INF] Cleanup zakończony pomyślnie: wyczyszczono 2,500 z 2,500 wiadomości w 1333ms
+
+Różne konfiguracje dla różnych środowisk:
+
+// appsettings.Development.json - częstsze czyszczenie dla testów
+{
+  "MessageCleanup": {
+    "Enabled": true,
+    "IntervalHours": 1,       // Co godzinę
+    "RetentionDays": 7,       // Tylko tydzień
+    "BatchSize": 100          // Mniejsze batch
+  }
+}
+
+// appsettings.Production.json - optymalizacja dla produkcji
+{
+  "MessageCleanup": {
+    "Enabled": true,
+    "IntervalHours": 24,      // Raz dziennie
+    "RetentionDays": 90,      // 3 miesiące
+    "BatchSize": 5000         // Większe batch dla performance
+  }
+}
+
+// appsettings.Test.json - wyłączone dla testów jednostkowych
+{
+  "MessageCleanup": {
+    "Enabled": false
+  }
+}
+
+Przykład custom health check dla cleanup service:
+
+public class MessageCleanupHealthCheck : IHealthCheck
+{
+    private readonly IMessageRepository _messageRepository;
+    private readonly IConfiguration _configuration;
+
+    public MessageCleanupHealthCheck(IMessageRepository messageRepository, IConfiguration configuration)
+    {
+        _messageRepository = messageRepository;
+        _configuration = configuration;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var retentionDays = _configuration.GetValue("MessageCleanup:RetentionDays", 30);
+            var expiredBefore = DateTime.UtcNow.AddDays(-retentionDays);
+            
+            var expiredCount = await _messageRepository.GetExpiredMessageCountAsync(expiredBefore);
+            
+            // Warning jeśli jest dużo expired messages (cleanup może mieć problem)
+            if (expiredCount > 10000)
+            {
+                return HealthCheckResult.Degraded($"Duża liczba wiadomości do wyczyszczenia: {expiredCount}");
+            }
+            
+            return HealthCheckResult.Healthy($"Cleanup działa prawidłowo. Do wyczyszczenia: {expiredCount}");
+        }
+        catch (Exception ex)
+        {
+            return HealthCheckResult.Unhealthy("Błąd podczas sprawdzania cleanup", ex);
+        }
+    }
+}
+
+// Rejestracja health check
+builder.Services.AddHealthChecks()
+    .AddCheck<MessageCleanupHealthCheck>("message_cleanup");
+
+Metryki dla Prometheus/Application Insights:
+
+public class MessageCleanupMetrics
+{
+    private readonly IMetricsLogger _metricsLogger;
+    
+    public void LogCleanupCompleted(int cleanedCount, int totalExpired, TimeSpan duration)
+    {
+        _metricsLogger.Counter("message_cleanup_cleaned_total")
+            .WithTag("batch_size", cleanedCount)
+            .Increment(cleanedCount);
+            
+        _metricsLogger.Histogram("message_cleanup_duration_ms")
+            .Record(duration.TotalMilliseconds);
+            
+        _metricsLogger.Gauge("message_cleanup_expired_remaining")
+            .Set(totalExpired - cleanedCount);
+    }
+}
+
+Przykład ręcznego uruchomienia cleanup (np. przez API endpoint):
+
+[ApiController]
+[Route("api/[controller]")]
+public class MaintenanceController : ControllerBase
+{
+    private readonly IMessageRepository _messageRepository;
+    
+    [HttpPost("cleanup-messages")]
+    [Authorize(Policy = "AdminOnly")]
+    public async Task<IActionResult> TriggerMessageCleanup(
+        [FromQuery] int retentionDays = 30,
+        [FromQuery] int batchSize = 1000)
+    {
+        try
+        {
+            var expiredBefore = DateTime.UtcNow.AddDays(-retentionDays);
+            var expiredCount = await _messageRepository.GetExpiredMessageCountAsync(expiredBefore);
+            
+            if (expiredCount == 0)
+            {
+                return Ok(new { message = "Brak wiadomości do wyczyszczenia", expiredCount = 0 });
+            }
+            
+            var cleanedCount = await _messageRepository.CleanupExpiredMessageContentAsync(expiredBefore, batchSize);
+            
+            return Ok(new 
+            { 
+                message = "Cleanup zakończony pomyślnie", 
+                cleanedCount, 
+                expiredCount,
+                retentionDays,
+                batchSize 
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = "Błąd podczas cleanup", details = ex.Message });
+        }
+    }
+    
+    [HttpGet("cleanup-status")]
+    public async Task<IActionResult> GetCleanupStatus([FromQuery] int retentionDays = 30)
+    {
+        try
+        {
+            var expiredBefore = DateTime.UtcNow.AddDays(-retentionDays);
+            var expiredCount = await _messageRepository.GetExpiredMessageCountAsync(expiredBefore);
+            
+            return Ok(new 
+            { 
+                expiredCount, 
+                retentionDays,
+                expiredBefore,
+                nextCleanupEstimate = DateTime.UtcNow.Date.AddDays(1).AddHours(2) // 2 AM następnego dnia
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = "Błąd podczas sprawdzania statusu", details = ex.Message });
+        }
+    }
+}
+
+Dlaczego usunąłem pętlę do-while:
+
+**Problem z oryginalną pętlą:**
+```csharp
+// BŁĘDNA LOGIKA - nieskończona pętla!
+do {
+    cleanedInBatch = UPDATE TOP(100) ... // Zawsze max 100
+    totalCleaned += cleanedInBatch;
+} while (cleanedInBatch == batchSize); // 100 == 100 → true → pętla w nieskończoność!
+```
+
+**Poprawione rozwiązanie:**
+```csharp
+// POPRAWNA LOGIKA - jedno wykonanie
+var cleanedCount = await connection.ExecuteAsync(sql, new { BatchSize = batchSize, ExpiredBefore = expiredBefore });
+```
+
+**Dlaczego to ma sens:**
+1. **Jeden batch na uruchomienie** - bezpieczne i przewidywalne
+2. **Background service uruchamia się co 24h** - wystarczy do utrzymania higieny danych
+3. **Jeśli jest dużo danych** - kolejne uruchomienie dokończy robotę
+4. **Nie blokuje DB** - krótkie, kontrolowane operacje
+
+**Przykład scenariusza:**
+- Mamy 2,500 expired messages
+- Batch size = 1000
+- 1. uruchomienie: czyści 1000, zostaje 1500
+- 2. uruchomienie (24h później): czyści 1000, zostaje 500  
+- 3. uruchomienie (24h później): czyści 500, zostaje 0
+
+**Jeśli potrzebujesz pełnego cleanup w jednym uruchomieniu:**
+- Zwiększ batch size (np. 10,000)
+- Lub użyj manual API endpoint z większym batch
+- Lub zmień IntervalHours na mniejszą wartość (np. 6h)
+
+1. **Index Strategy:**
+   - Indeks na (ValidTo, Content IS NOT NULL) dla szybkich cleanup
+   - Partitioning tabeli po dacie jeśli duże wolumeny
+   
+2. **Batch Size Tuning:**
+   - Mniejsze batch (100-500) dla systemów z wysokim load
+   - Większe batch (5000+) dla systemów z niskim load
+   - Monitoruj average cleanup duration
+   
+3. **Timing Optimization:**
+   - Uruchamiaj w godzinach niskiego ruchu (2-4 AM)
+   - Unikaj uruchamiania podczas backup
+   - Dostosuj delay między batch do obciążenia DB
+   
+4. **Monitoring Alerts:**
+   - Alert jeśli cleanup trwa > 30 minut
+   - Alert jeśli liczba expired messages > threshold
+   - Alert jeśli cleanup service nie uruchomił się przez 25 godzin
+
+Przykład advanced konfiguracji z multiple retention policies:
+
+{
+  "MessageCleanup": {
+    "Enabled": true,
+    "IntervalHours": 24,
+    "Policies": [
+      {
+        "QueuePattern": "critical.*",
+        "RetentionDays": 90,
+        "BatchSize": 500
+      },
+      {
+        "QueuePattern": "notifications.*", 
+        "RetentionDays": 7,
+        "BatchSize": 2000
+      },
+      {
+        "QueuePattern": "*",
+        "RetentionDays": 30,
+        "BatchSize": 1000
+      }
+    ]
+  }
+}
+*/
