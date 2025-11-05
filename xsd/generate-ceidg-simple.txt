@@ -1,0 +1,183 @@
+# Prostsza wersja skryptu PowerShell do generowania klas C# z CEIDG XSD
+# Bez skomplikowanych konstrukcji, łatwiejsza do debugowania
+
+param(
+    [string]$CeidgXsdPath = "CEIDG-1_10122023.xsd",
+    [string]$OutputDir = "Generated",
+    [string]$CacheDir = "SchemaCache",
+    [switch]$SkipDownload = $false,
+    [switch]$UseUniqueNames = $false
+)
+
+Write-Host "=== Generator klas CEIDG - wersja uproszczona ===" -ForegroundColor Green
+
+# Krok 1: Sprawdź czy xscgen jest zainstalowany
+Write-Host "`n[1/6] Sprawdzanie xscgen..." -ForegroundColor Cyan
+$xscgenInstalled = $null -ne (dotnet tool list -g | Select-String "dotnet-xscgen")
+if (-not $xscgenInstalled) {
+    Write-Host "   Instalowanie xscgen..." -ForegroundColor Yellow
+    dotnet tool install --global dotnet-xscgen
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "   BŁĄD: Nie można zainstalować xscgen!" -ForegroundColor Red
+        exit 1
+    }
+}
+else {
+    Write-Host "   OK: xscgen jest zainstalowany" -ForegroundColor Green
+}
+
+# Krok 2: Przygotuj katalogi
+Write-Host "`n[2/6] Przygotowanie katalogów..." -ForegroundColor Cyan
+if (Test-Path $OutputDir) {
+    Remove-Item $OutputDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
+Write-Host "   OK: Katalogi przygotowane" -ForegroundColor Green
+
+# Krok 3: Pobierz zewnętrzne schematy (jeśli nie pominięto)
+if (-not $SkipDownload) {
+    Write-Host "`n[3/6] Pobieranie zewnętrznych schematów..." -ForegroundColor Cyan
+    
+    $schemas = @{
+        "osoba.xsd" = "http://crd.gov.pl/xml/schematy/osoba/2009/11/16/osoba.xsd"
+        "meta.xsd" = "http://crd.gov.pl/xml/schematy/meta/2009/11/16/meta.xsd"
+        "struktura.xsd" = "http://crd.gov.pl/xml/schematy/struktura/2009/11/16/struktura.xsd"
+        "xmldsig-core-schema.xsd" = "http://www.w3.org/TR/xmldsig-core/xmldsig-core-schema.xsd"
+    }
+    
+    foreach ($file in $schemas.Keys) {
+        $localPath = Join-Path $CacheDir $file
+        if (Test-Path $localPath) {
+            Write-Host "   OK: $file (cache)" -ForegroundColor Gray
+        }
+        else {
+            Write-Host "   Pobieranie: $file" -ForegroundColor Gray
+            try {
+                Invoke-WebRequest -Uri $schemas[$file] -OutFile $localPath -UseBasicParsing
+                Write-Host "   OK: $file (pobrano)" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "   UWAGA: Nie można pobrać $file" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+else {
+    Write-Host "`n[3/6] Pomijanie pobierania schematów (--SkipDownload)" -ForegroundColor Yellow
+}
+
+# Krok 4: Przygotuj lokalną kopię głównego XSD
+Write-Host "`n[4/6] Przygotowanie głównego pliku XSD..." -ForegroundColor Cyan
+$localXsdPath = Join-Path $CacheDir "CEIDG-1_10122023_local.xsd"
+$content = Get-Content $CeidgXsdPath -Raw
+
+# Zamień URL-e na lokalne ścieżki
+$replacements = @{
+    'schemaLocation="http://crd.gov.pl/xml/schematy/osoba/2009/11/16/osoba.xsd"' = 'schemaLocation="osoba.xsd"'
+    'schemaLocation="http://crd.gov.pl/xml/schematy/meta/2009/11/16/meta.xsd"' = 'schemaLocation="meta.xsd"'
+    'schemaLocation="http://crd.gov.pl/xml/schematy/struktura/2009/11/16/struktura.xsd"' = 'schemaLocation="struktura.xsd"'
+    'schemaLocation="http://www.w3.org/TR/xmldsig-core/xmldsig-core-schema.xsd"' = 'schemaLocation="xmldsig-core-schema.xsd"'
+}
+
+foreach ($old in $replacements.Keys) {
+    $content = $content -replace [regex]::Escape($old), $replacements[$old]
+}
+
+Set-Content -Path $localXsdPath -Value $content -Encoding UTF8
+Write-Host "   OK: Plik przygotowany" -ForegroundColor Green
+
+# Krok 5: Stwórz plik mapowania namespace'ów
+Write-Host "`n[5/6] Tworzenie mapowania namespace'ów..." -ForegroundColor Cyan
+$namespacesPath = Join-Path $CacheDir "namespaces.txt"
+@"
+# Mapowanie namespace'ów XML na C#
+http://crd.gov.pl/wzor/2023/12/10/ = Ceidg.Wzor
+http://crd.gov.pl/xml/schematy/osoba/2009/11/16/ = Ceidg.Osoba
+http://crd.gov.pl/xml/schematy/meta/2009/11/16/ = Ceidg.Meta
+http://crd.gov.pl/xml/schematy/struktura/2009/11/16/ = Ceidg.Struktura
+http://www.w3.org/2000/09/xmldsig# = Ceidg.XmlDSig
+"@ | Set-Content -Path $namespacesPath -Encoding UTF8
+Write-Host "   OK: Mapowanie utworzone" -ForegroundColor Green
+
+# Krok 6: Generuj klasy C#
+Write-Host "`n[6/6] Generowanie klas C#..." -ForegroundColor Cyan
+
+# Przejdź do katalogu cache (ważne dla relative paths w XSD)
+Push-Location $CacheDir
+
+try {
+    # Buduj argumenty
+    $args = @(
+        "--nf", "namespaces.txt",
+        "--separateFiles",
+        "--output", "..\$OutputDir",
+        "--nullable",
+        "--netCore",
+        "--namespaceHierarchy",
+        "CEIDG-1_10122023_local.xsd"
+    )
+    
+    if ($UseUniqueNames) {
+        $args = @("--uniqueTypeNames") + $args
+    }
+    
+    Write-Host "   Wywołanie: xscgen $($args -join ' ')" -ForegroundColor Gray
+    
+    # Wykonaj xscgen
+    & xscgen $args
+    
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "   OK: Klasy wygenerowane!" -ForegroundColor Green
+    }
+    else {
+        Write-Host "   BŁĄD: xscgen zwrócił kod błędu $LASTEXITCODE" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+}
+finally {
+    Pop-Location
+}
+
+# Podsumowanie
+Write-Host "`n=== PODSUMOWANIE ===" -ForegroundColor Green
+if (Test-Path $OutputDir) {
+    $files = Get-ChildItem -Path $OutputDir -Filter "*.cs" -Recurse
+    Write-Host "Wygenerowano plików: $($files.Count)" -ForegroundColor Cyan
+    Write-Host "Lokalizacja: $((Get-Item $OutputDir).FullName)" -ForegroundColor Cyan
+    
+    # Pokaż strukturę
+    Write-Host "`nStruktura katalogów:" -ForegroundColor Yellow
+    Get-ChildItem -Path $OutputDir -Directory | ForEach-Object {
+        Write-Host "  📁 $($_.Name)" -ForegroundColor Gray
+        Get-ChildItem -Path $_.FullName -Directory | ForEach-Object {
+            Write-Host "     📁 $($_.Name)" -ForegroundColor DarkGray
+        }
+    }
+    
+    # Przykładowe pliki
+    Write-Host "`nPrzykładowe wygenerowane klasy:" -ForegroundColor Yellow
+    $files | Select-Object -First 5 | ForEach-Object {
+        $relativePath = $_.FullName.Replace("$PWD\", "")
+        Write-Host "  📄 $relativePath" -ForegroundColor Gray
+    }
+}
+
+Write-Host "`n=== JAK UŻYWAĆ ===" -ForegroundColor Green
+Write-Host @"
+1. Dodaj do projektu .csproj:
+   <ItemGroup>
+     <Compile Include="$OutputDir\**\*.cs" />
+   </ItemGroup>
+
+2. W kodzie C#:
+   using Ceidg.Wzor;
+   using Ceidg.Osoba;
+   
+   var instytucja = new InstytucjaTyp();
+
+3. Jeśli są konflikty nazw, uruchom ponownie z:
+   .\generate-ceidg-simple.ps1 -UseUniqueNames
+"@ -ForegroundColor Cyan
+
+Write-Host "`nGotowe!" -ForegroundColor Green

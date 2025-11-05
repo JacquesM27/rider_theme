@@ -1,0 +1,146 @@
+# PowerShell script do generowania klas C# z CEIDG XSD
+# Obsługuje zewnętrzne schematy przez schemaLocation
+
+# 1. Instalacja narzędzia (jeśli nie jest zainstalowane)
+Write-Host "Sprawdzanie instalacji XmlSchemaClassGenerator..." -ForegroundColor Green
+$toolInstalled = dotnet tool list -g | Select-String "dotnet-xscgen"
+if (-not $toolInstalled) {
+    Write-Host "Instalowanie XmlSchemaClassGenerator..." -ForegroundColor Yellow
+    dotnet tool install --global dotnet-xscgen
+}
+
+# 2. Przygotowanie katalogów
+$outputDir = "Generated"
+$cacheDir = "SchemaCache"
+
+if (Test-Path $outputDir) {
+    Remove-Item $outputDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+
+# 3. Pobieranie zewnętrznych schematów
+Write-Host "`nPobieranie zewnętrznych schematów..." -ForegroundColor Green
+
+$schemasToDownload = @(
+    @{
+        Url = "http://crd.gov.pl/xml/schematy/osoba/2009/11/16/osoba.xsd"
+        File = "$cacheDir/osoba.xsd"
+    },
+    @{
+        Url = "http://crd.gov.pl/xml/schematy/meta/2009/11/16/meta.xsd"
+        File = "$cacheDir/meta.xsd"
+    },
+    @{
+        Url = "http://crd.gov.pl/xml/schematy/struktura/2009/11/16/struktura.xsd"
+        File = "$cacheDir/struktura.xsd"
+    },
+    @{
+        Url = "http://www.w3.org/TR/xmldsig-core/xmldsig-core-schema.xsd"
+        File = "$cacheDir/xmldsig-core-schema.xsd"
+    }
+)
+
+foreach ($schema in $schemasToDownload) {
+    if (-not (Test-Path $schema.File)) {
+        Write-Host "  Pobieranie: $($schema.Url)" -ForegroundColor Gray
+        try {
+            Invoke-WebRequest -Uri $schema.Url -OutFile $schema.File
+        }
+        catch {
+            Write-Host "  UWAGA: Nie można pobrać $($schema.Url)" -ForegroundColor Yellow
+            Write-Host "         Sprawdź połączenie lub pobierz ręcznie" -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "  Używam z cache: $($schema.File)" -ForegroundColor Gray
+    }
+}
+
+# 4. Kopiowanie głównego pliku CEIDG
+Copy-Item "CEIDG-1_10122023.xsd" "$cacheDir/CEIDG-1_10122023.xsd" -Force
+
+# 5. Modyfikacja głównego pliku - zmiana schemaLocation na lokalne ścieżki
+Write-Host "`nModyfikowanie schemaLocation na lokalne ścieżki..." -ForegroundColor Green
+$ceidgContent = Get-Content "$cacheDir/CEIDG-1_10122023.xsd" -Raw
+$ceidgContent = $ceidgContent -replace 'schemaLocation="http://crd.gov.pl/xml/schematy/osoba/2009/11/16/osoba.xsd"', 'schemaLocation="osoba.xsd"'
+$ceidgContent = $ceidgContent -replace 'schemaLocation="http://crd.gov.pl/xml/schematy/meta/2009/11/16/meta.xsd"', 'schemaLocation="meta.xsd"'
+$ceidgContent = $ceidgContent -replace 'schemaLocation="http://crd.gov.pl/xml/schematy/struktura/2009/11/16/struktura.xsd"', 'schemaLocation="struktura.xsd"'
+$ceidgContent = $ceidgContent -replace 'schemaLocation="http://www.w3.org/TR/xmldsig-core/xmldsig-core-schema.xsd"', 'schemaLocation="xmldsig-core-schema.xsd"'
+Set-Content "$cacheDir/CEIDG-1_10122023_local.xsd" $ceidgContent
+
+# 6. Przygotowanie mapowania namespace'ów
+Write-Host "`nPrzygotowywanie mapowania namespace'ów..." -ForegroundColor Green
+$namespaceMapping = @"
+# Mapowanie namespace'ów XML na C#
+http://crd.gov.pl/wzor/2023/12/10/ = Ceidg.Wzor
+http://crd.gov.pl/xml/schematy/osoba/2009/11/16/ = Ceidg.Osoba
+http://crd.gov.pl/xml/schematy/meta/2009/11/16/ = Ceidg.Meta
+http://crd.gov.pl/xml/schematy/struktura/2009/11/16/ = Ceidg.Struktura
+http://www.w3.org/2000/09/xmldsig# = Ceidg.XmlDSig
+"@
+Set-Content "$cacheDir/namespaces.txt" $namespaceMapping
+
+# 7. Generowanie klas C#
+Write-Host "`nGenerowanie klas C#..." -ForegroundColor Green
+
+# Budowanie komendy jako pojedynczego stringa
+$generateCommand = "xscgen --nf `"$cacheDir\namespaces.txt`" --separateFiles --output `"$outputDir`" --nullable --netCore --namespaceHierarchy `"$cacheDir\CEIDG-1_10122023_local.xsd`""
+
+Write-Host "Wykonywanie: $generateCommand" -ForegroundColor Gray
+
+# Wykonanie komendy
+try {
+    Invoke-Expression $generateCommand
+    Write-Host "Generowanie zakończone sukcesem!" -ForegroundColor Green
+}
+catch {
+    Write-Host "Błąd podczas generowania: $_" -ForegroundColor Red
+    
+    # Alternatywna metoda - bezpośrednie wywołanie
+    Write-Host "Próba alternatywnej metody..." -ForegroundColor Yellow
+    & xscgen --nf "$cacheDir\namespaces.txt" `
+             --separateFiles `
+             --output "$outputDir" `
+             --nullable `
+             --netCore `
+             --namespaceHierarchy `
+             "$cacheDir\CEIDG-1_10122023_local.xsd"
+}
+
+# Alternatywna komenda z unikalnymi nazwami typów (odkomentuj jeśli potrzebne)
+# $generateCommandUnique = "xscgen --nf `"$cacheDir\namespaces.txt`" --separateFiles --output `"$outputDir`" --nullable --netCore --namespaceHierarchy --uniqueTypeNames `"$cacheDir\CEIDG-1_10122023_local.xsd`""
+
+# 8. Podsumowanie
+Write-Host "`n=== PODSUMOWANIE ===" -ForegroundColor Green
+if (Test-Path $outputDir) {
+    $generatedFiles = Get-ChildItem -Path $outputDir -Recurse -Filter "*.cs"
+    Write-Host "Wygenerowano $($generatedFiles.Count) plików C#" -ForegroundColor Cyan
+    Write-Host "Lokalizacja: $outputDir" -ForegroundColor Cyan
+    
+    Write-Host "`nStruktura katalogów:" -ForegroundColor Yellow
+    Get-ChildItem -Path $outputDir -Directory -Recurse | ForEach-Object {
+        Write-Host "  📁 $($_.FullName.Replace($PWD, '.'))" -ForegroundColor Gray
+    }
+    
+    Write-Host "`nPrzykładowe pliki:" -ForegroundColor Yellow
+    $generatedFiles | Select-Object -First 10 | ForEach-Object {
+        Write-Host "  📄 $($_.FullName.Replace($PWD, '.'))" -ForegroundColor Gray
+    }
+}
+else {
+    Write-Host "BŁĄD: Nie udało się wygenerować klas" -ForegroundColor Red
+}
+
+Write-Host "`n=== UŻYCIE W PROJEKCIE ===" -ForegroundColor Green
+Write-Host @"
+1. Skopiuj katalog 'Generated' do swojego projektu
+2. Dodaj do .csproj:
+   <ItemGroup>
+     <Compile Include="Generated\**\*.cs" />
+   </ItemGroup>
+3. Używaj w kodzie:
+   using Ceidg.Wzor;
+   using Ceidg.Osoba;
+   // itd.
+"@ -ForegroundColor Cyan
